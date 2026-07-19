@@ -1,0 +1,154 @@
+openapi: 3.0.3
+info:
+  title: Workflow Units Contract (catalog + invoke)
+  version: 1.0.0
+  description: >
+    Shared contract that BOTH ai-multi-agent (orchestrator) and automation-server
+    MUST implement, so the web treats AI agents and automation tools identically
+    when adding them as workflow steps. Orchestrator additionally exposes the
+    workflow-run endpoints described in the project spec (section 6a).
+
+servers:
+  - url: http://localhost:8001
+    description: ai-multi-agent orchestrator
+  - url: http://localhost:8002
+    description: automation-server
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness probe
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /catalog:
+    get:
+      operationId: getCatalog
+      summary: List invokable units (agents or automation tools)
+      responses:
+        "200":
+          description: Catalog list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Unit"
+
+  /invoke:
+    post:
+      operationId: invokeUnit
+      summary: Invoke a unit; returns a runId to poll
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InvokeRequest"
+      responses:
+        "200":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvokeAccepted"
+
+  /invoke/{runId}:
+    get:
+      operationId: getInvokeResult
+      summary: Poll a unit invocation result
+      parameters:
+        - name: runId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Current invocation state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvokeResult"
+
+components:
+  schemas:
+    Health:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    UnitType:
+      type: string
+      enum: [ai_agent, automation_tool]
+
+    Unit:
+      type: object
+      required: [id, name, type, description, inputSchema, outputSchema, configurable]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          $ref: "#/components/schemas/UnitType"
+        description:
+          type: string
+        inputSchema:
+          type: object
+          description: JSON Schema of expected input
+          additionalProperties: true
+        outputSchema:
+          type: object
+          description: JSON Schema of produced output
+          additionalProperties: true
+        configurable:
+          type: boolean
+
+    InvokeRequest:
+      type: object
+      required: [unitId, input]
+      properties:
+        unitId:
+          type: string
+        input:
+          type: object
+          additionalProperties: true
+        config:
+          type: object
+          additionalProperties: true
+
+    InvokeAccepted:
+      type: object
+      required: [runId]
+      properties:
+        runId:
+          type: string
+
+    InvokeStatus:
+      type: string
+      enum: [queued, running, done, failed]
+
+    InvokeResult:
+      type: object
+      required: [status, done]
+      properties:
+        status:
+          $ref: "#/components/schemas/InvokeStatus"
+        input:
+          type: object
+          additionalProperties: true
+        output:
+          type: object
+          nullable: true
+          additionalProperties: true
+        done:
+          type: boolean

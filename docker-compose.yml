@@ -1,0 +1,53 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  automation-server:
+    build: ./automation-server
+    ports:
+      - "8002:8002"
+    environment:
+      - PORT=8002
+
+  ai-multi-agent-api:
+    build: ./ai-multi-agent
+    ports:
+      - "8001:8001"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - SQLITE_PATH=/data/orchestrator.db
+      - AUTOMATION_SERVER_URL=http://automation-server:8002
+    volumes:
+      - agent-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["uvicorn", "orchestrator.app:app", "--host", "0.0.0.0", "--port", "8001"]
+
+  ai-multi-agent-workers:
+    build: ./ai-multi-agent
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - SQLITE_PATH=/data/orchestrator.db
+      - AUTOMATION_SERVER_URL=http://automation-server:8002
+      - WORKER_CONCURRENCY=6
+    volumes:
+      - agent-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    # One container, all 6 agent queues, concurrency>1 -> visible parallelism.
+    command: >
+      celery -A shared.celery_app.celery_app worker
+      -Q queue:parser,queue:planner,queue:execution,queue:verification,queue:report,queue:self_healing
+      --concurrency=6 --loglevel=info
+
+volumes:
+  agent-data:

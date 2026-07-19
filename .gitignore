@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.db-wal
+*.db-shm
+
+# Node / Next
+node_modules/
+.next/
+.env
+.env.local
+
+# uv
+.uv/

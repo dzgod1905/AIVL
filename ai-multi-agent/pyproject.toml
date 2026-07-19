@@ -1,0 +1,16 @@
+[project]
+name = "ai-multi-agent"
+version = "0.1.0"
+description = "Orchestrator (coordinator agent) + 6 dummy peer agents on Celery/Redis"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "celery>=5.3",
+    "redis>=5.0",
+    "httpx>=0.27",
+    "pydantic>=2.6",
+]
+
+[tool.uv]
+package = false
