@@ -1,13 +1,17 @@
 /**
- * Seed demo workflows (acceptance criteria mục 10).
+ * Seed demo workflows.
  * Run: DATABASE_URL=... npm run db:seed  (after db:push)
+ *
+ * Uses only the units the orchestrator catalog actually serves
+ * (see ai-multi-agent/orchestrator/app.py _UNITS): `excel_reader` (parser) and
+ * `ai_agent` (prompt runner). Any other unitId is rejected by POST /runs.
  */
 import "dotenv/config";
 import { db, schema } from "./index";
 
 type Step = {
   stepKey: string;
-  unitId: string;
+  unitId: "ai_agent" | "excel_reader";
   humanInvolved?: boolean;
   dependsOn?: string[];
   promptTemplate?: string;
@@ -24,10 +28,9 @@ async function seedWorkflow(name: string, steps: Step[]) {
       order: i,
       stepKey: s.stepKey,
       unitId: s.unitId,
-      unitType: "ai_agent",
-      source: "ai",
+      unitType: "ai_agent" as const,
+      source: "ai" as const,
       promptTemplate: s.promptTemplate ?? null,
-      contextMapping: {},
       apiConfig: s.config ?? {},
       dependsOn: s.dependsOn ?? [],
       humanInvolved: s.humanInvolved ?? false,
@@ -39,34 +42,55 @@ async function seedWorkflow(name: string, steps: Step[]) {
 }
 
 async function main() {
-  // A. Linear with human pause. Planner also re-asks once (simulate_incomplete default 1).
+  // A. Linear with human pause. The AI step re-asks once (simulate_incomplete
+  //    default 1) then pauses for human review before the run completes.
   await seedWorkflow("Demo Linear (human pause)", [
-    { stepKey: "parser", unitId: "parser" },
+    { stepKey: "excel", unitId: "excel_reader" },
     {
-      stepKey: "planner",
-      unitId: "planner",
-      dependsOn: ["parser"],
+      stepKey: "summary",
+      unitId: "ai_agent",
+      dependsOn: ["excel"],
       humanInvolved: true,
-      promptTemplate: "From {{parser.output}}, build a step-by-step plan.",
+      promptTemplate: "Summarize this data: {{excel.output}}",
     },
-    { stepKey: "execution", unitId: "execution", dependsOn: ["planner"] },
   ]);
 
-  // B. Branch: Verification & Report run in parallel after Execution; Self-Healing after both.
-  await seedWorkflow("Demo Branch (parallel)", [
-    { stepKey: "execution", unitId: "execution" },
-    { stepKey: "verification", unitId: "verification", dependsOn: ["execution"] },
-    { stepKey: "report", unitId: "report", dependsOn: ["execution"] },
-    { stepKey: "self_healing", unitId: "self_healing", dependsOn: ["verification", "report"] },
-  ]);
-
-  // C. Timeout: execution stuck (always done=false) -> failed at maxAttempts/timeoutSec.
-  await seedWorkflow("Demo Timeout (stuck agent)", [
-    { stepKey: "parser", unitId: "parser" },
+  // B. Chain: parse -> plan -> report, each AI step references the prior output.
+  await seedWorkflow("Demo Chain (parse -> plan -> report)", [
+    { stepKey: "excel", unitId: "excel_reader" },
     {
-      stepKey: "execution",
-      unitId: "execution",
-      dependsOn: ["parser"],
+      stepKey: "plan",
+      unitId: "ai_agent",
+      dependsOn: ["excel"],
+      promptTemplate: "From {{excel.output}}, build a step-by-step plan.",
+    },
+    {
+      stepKey: "report",
+      unitId: "ai_agent",
+      dependsOn: ["plan"],
+      promptTemplate: "Write a report for this plan: {{plan.output}}",
+    },
+  ]);
+
+  // C. Re-ask x3: the AI step reports done=false 3 times before done=true.
+  await seedWorkflow("Demo Re-ask (x3)", [
+    {
+      stepKey: "draft",
+      unitId: "ai_agent",
+      config: { simulate_incomplete: 3 },
+      maxAttempts: 8,
+      timeoutSec: 30,
+    },
+  ]);
+
+  // D. Timeout: the AI step is stuck (always done=false) -> failed at
+  //    maxAttempts / timeoutSec (proves the re-ask loop does not hang).
+  await seedWorkflow("Demo Timeout (stuck agent)", [
+    { stepKey: "excel", unitId: "excel_reader" },
+    {
+      stepKey: "stuck",
+      unitId: "ai_agent",
+      dependsOn: ["excel"],
       config: { stuck: true },
       maxAttempts: 3,
       timeoutSec: 5,

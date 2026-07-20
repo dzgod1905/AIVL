@@ -1,18 +1,20 @@
-"""Orchestrator engine: DAG state machine + pull-based dispatch loop.
+"""Orchestrator engine: sequential per-run executor + pull-based dispatch.
 
-Key ideas (spec mục 6a / 8):
-- A step is *runnable* when ALL steps in its dependsOn are `done`. Each dispatch
-  round finds EVERY runnable step and dispatches them at once -> independent
-  branches run in parallel.
-- Work distribution to agents is NOT hand-written here. The orchestrator only
-  pushes a Celery task onto the agent's queue (agents.<name> -> queue:<name>);
-  whichever idle worker pulls it does the work. Worker concurrency simulates the
-  number of instances per agent.
+Key ideas:
+- Within ONE run, steps execute strictly in listed order (sequential). A step
+  starts only after the previous step is `done`; steps in a run never overlap.
+  `dependsOn` is NOT a scheduler input here - it only tells the builder which
+  prior-step outputs a step references (for {{stepKey.output}} variables).
+- Concurrency is BETWEEN runs, not within one: each run has its own loop thread,
+  and different runs sit at different steps at the same time. The Celery worker
+  pool multiplexes those steps - an idle worker pulls the next task off the
+  agent's queue (node.<name> -> queue:<name>). That cross-run multiplexing IS the
+  "scheduler".
 - If an agent reports done=false, the orchestrator re-asks (re-dispatch with
   attempt+1) after a short delay, bounded by maxAttempts AND timeoutSec. On
   breach: step=failed (fail_reason max_attempts_exceeded / timeout), run=failed.
-- If a finished step has humanInvolved=true: run -> paused_for_human and NO new
-  dispatch happens (even for other parallel branches) until /resume.
+- If a finished step has humanInvolved=true: run -> paused_for_human and the run
+  waits (no next step) until /resume.
 """
 from __future__ import annotations
 
@@ -44,6 +46,8 @@ class Run:
         self.workflow_id = req.workflowId
         self.initial_input = req.input
         self.steps: dict[str, StepSpec] = {s.stepKey: s for s in req.steps}
+        # execution order = the order steps arrive in (web sends them ordered).
+        self.order: list[str] = [s.stepKey for s in req.steps]
         self.status = R_RUNNING
         self.step_status: dict[str, str] = {k: PENDING for k in self.steps}
         self.step_output: dict[str, Any] = {}
@@ -112,74 +116,53 @@ class Engine:
     # ---- scheduling -------------------------------------------------------
 
     def _schedule_loop(self, run: Run) -> None:
-        """Main per-run loop: repeatedly dispatch all runnable steps."""
-        try:
-            while True:
-                with run.cond:
-                    if run.status in (R_DONE, R_FAILED):
-                        return
-                    if run.status == R_PAUSED:
-                        # wait until resume
-                        run.cond.wait_for(lambda: run.status != R_PAUSED, timeout=1.0)
-                        continue
+        """Per-run loop: execute steps one at a time, in listed order.
 
-                    # terminal check
-                    statuses = run.step_status
-                    if all(s == DONE for s in statuses.values()):
-                        run.status = R_DONE
-                        db.set_run_status(run.id, R_DONE)
-                        self._emit(run, {"type": "run_status", "status": R_DONE})
+        Sequential by design - the next step starts only after the current one is
+        `done`. Parallelism lives BETWEEN runs (many loops + the worker pool), not
+        inside a single run.
+        """
+        try:
+            for step_key in run.order:
+                with run.cond:
+                    if run.status == R_FAILED:
                         return
-                    if any(s == FAILED for s in statuses.values()):
+                    run.step_status[step_key] = RUNNING
+                    run.inflight.add(step_key)
+
+                # runs to completion (blocks): sets DONE/FAILED, re-asks, and may
+                # flip the run to paused_for_human at the end.
+                self._execute_step(run, step_key)
+
+                with run.cond:
+                    if run.step_status[step_key] == FAILED:
                         run.status = R_FAILED
                         db.set_run_status(run.id, R_FAILED)
                         self._emit(run, {"type": "run_status", "status": R_FAILED})
                         return
+                    # human review pause: hold here until /resume before the next step
+                    run.cond.wait_for(lambda: run.status != R_PAUSED)
 
-                    runnable = self._find_runnable(run)
-                    for sk in runnable:
-                        run.step_status[sk] = RUNNING
-                        run.inflight.add(sk)
-                        threading.Thread(
-                            target=self._execute_step, args=(run, sk), daemon=True
-                        ).start()
-
-                    if not runnable and not run.inflight:
-                        # nothing runnable and nothing running -> deadlock guard
-                        run.status = R_FAILED
-                        db.set_run_status(run.id, R_FAILED)
-                        self._emit(run, {"type": "run_status", "status": R_FAILED,
-                                         "reason": "no_runnable_steps"})
-                        return
-
-                    # wait for a step to finish (or pause/resume) then re-evaluate
-                    run.cond.wait(timeout=1.0)
+            with run.cond:
+                run.status = R_DONE
+                db.set_run_status(run.id, R_DONE)
+            self._emit(run, {"type": "run_status", "status": R_DONE})
         except Exception as exc:  # pragma: no cover - safety net
-            log.exception("schedule loop crashed: %s", exc)
+            log.exception("run loop crashed: %s", exc)
             with run.cond:
                 run.status = R_FAILED
                 db.set_run_status(run.id, R_FAILED)
             self._emit(run, {"type": "run_status", "status": R_FAILED, "reason": str(exc)})
 
-    def _find_runnable(self, run: Run) -> list[str]:
-        """All pending steps whose deps are all done. Caller holds run.lock."""
-        out = []
-        for sk, spec in run.steps.items():
-            if run.step_status[sk] != PENDING:
-                continue
-            if all(run.step_status.get(d) == DONE for d in spec.dependsOn):
-                out.append(sk)
-        return out
-
     # ---- step execution ---------------------------------------------------
 
     def _build_input(self, run: Run, spec: StepSpec) -> dict[str, Any]:
-        """Build a step's input: initial input + contextMapping + rendered prompt."""
-        step_input: dict[str, Any] = dict(run.initial_input)
+        """Build a step's input: initial input + rendered prompt.
 
-        # contextMapping: "<targetField>" -> "<depStepKey>.output[.path]"
-        for target, ref in spec.contextMapping.items():
-            step_input[target] = self._resolve_ref(run, ref)
+        Because steps run in order, any {{stepKey.output}} a prompt references
+        belongs to an already-finished earlier step, so it resolves here.
+        """
+        step_input: dict[str, Any] = dict(run.initial_input)
 
         # promptTemplate rendering (ai_agent only): replace {{stepKey.output}}
         if spec.promptTemplate and spec.unitType == "ai_agent":
@@ -250,7 +233,7 @@ class Engine:
                 self._agent_mark(agent, +1)
                 try:
                     payload = {"input": step_input, "attempt": attempt, "config": spec.config}
-                    ar: AsyncResult = celery_app.send_task(f"agents.{agent}", args=[payload])
+                    ar: AsyncResult = celery_app.send_task(f"node.{agent}", args=[payload])
                     res = ar.get(timeout=max(1, spec.timeoutSec), propagate=True)
                     done = bool(res.get("done"))
                     output = res.get("output")
@@ -319,26 +302,3 @@ class Engine:
 
 
 engine = Engine()
-
-
-# ---- cycle detection (used by web on save; exposed for reuse) -------------
-
-def has_cycle(steps: list[dict[str, Any]]) -> bool:
-    """steps: list of {stepKey, dependsOn:[...]}. Returns True if a cycle exists."""
-    graph = {s["stepKey"]: list(s.get("dependsOn", [])) for s in steps}
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color = {k: WHITE for k in graph}
-
-    def dfs(node: str) -> bool:
-        color[node] = GRAY
-        for dep in graph.get(node, []):
-            if dep not in color:
-                continue
-            if color[dep] == GRAY:
-                return True
-            if color[dep] == WHITE and dfs(dep):
-                return True
-        color[node] = BLACK
-        return False
-
-    return any(color[n] == WHITE and dfs(n) for n in graph)

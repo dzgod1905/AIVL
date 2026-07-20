@@ -1,0 +1,18 @@
+# automation-server stack (deployable on its own machine, separate from the
+# ai-multi-agent stack). The orchestrator reaches this over the network via its
+# AUTOMATION_SERVER_URL, authenticating with AUTOMATION_API_TOKEN.
+#
+# Reads variables from a `.env` file in THIS directory (copy .env.example).
+# Required: AUTOMATION_API_TOKEN (must match the orchestrator's value).
+#
+# Security note: publishes 8002 bound to AUTOMATION_BIND (default 127.0.0.1).
+# To let the orchestrator machine reach it, set AUTOMATION_BIND=0.0.0.0 AND
+# restrict access with the bearer token + firewall / private overlay.
+services:
+  automation-server:
+    build: .
+    ports:
+      - "${AUTOMATION_BIND:-127.0.0.1}:8002:8002"
+    environment:
+      - PORT=8002
+      - AUTOMATION_API_TOKEN=${AUTOMATION_API_TOKEN:?set AUTOMATION_API_TOKEN}

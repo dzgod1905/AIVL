@@ -6,25 +6,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-# ---- shared contract (mục 4) ---------------------------------------------
-
-class Unit(BaseModel):
-    id: str
-    name: str
-    type: Literal["ai_agent", "automation_tool"]
-    description: str
-    inputSchema: dict[str, Any]
-    outputSchema: dict[str, Any]
-    configurable: bool
-
-
-class InvokeRequest(BaseModel):
-    unitId: str
-    input: dict[str, Any] = Field(default_factory=dict)
-    config: dict[str, Any] | None = None
-
-
 # ---- orchestrator run API (mục 6a) ---------------------------------------
+# NB: the /catalog response is built as plain dicts in app.py (it carries an
+# extra `category` field the builder groups by), so there is no Unit model here.
 
 class StepSpec(BaseModel):
     stepKey: str
@@ -32,7 +16,8 @@ class StepSpec(BaseModel):
     unitType: Literal["ai_agent", "automation_tool"]
     source: Literal["ai", "automation"]
     promptTemplate: str | None = None
-    contextMapping: dict[str, str] = Field(default_factory=dict)
+    # dependsOn is NOT a scheduler input (steps run in order). It records which
+    # prior steps a prompt references, for {{stepKey.output}} variable resolution.
     dependsOn: list[str] = Field(default_factory=list)
     humanInvolved: bool = False
     maxAttempts: int = 5

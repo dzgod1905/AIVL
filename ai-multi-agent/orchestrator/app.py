@@ -5,26 +5,56 @@ Endpoints:
   GET  /runs/{id}            run status + per-step input/output (from SQLite)
   POST /runs/{id}/resume     continue after human review
   GET  /runs/{id}/events     SSE stream of status updates
-  GET  /catalog              list the 6 AI agents (contract mục 4)
+  GET  /catalog              list the AI/parser units (contract mục 4)
   GET  /agents               busy/idle per agent (observability)
-  POST /invoke, GET /invoke/{runId}   single-unit invoke (contract parity)
   GET  /health
 """
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import logging
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from shared import config, db
-from shared.schemas import CreateRunRequest, InvokeRequest, StepSpec
+from shared.schemas import CreateRunRequest, RunView
 from orchestrator.engine import engine, R_DONE, R_FAILED
 from orchestrator.events import bus
 
-app = FastAPI(title="ai-multi-agent orchestrator", version="0.1.0")
+log = logging.getLogger("orchestrator.app")
+
+
+def _require_token(request: Request) -> None:
+    """Bearer-token gate applied to every route except /health.
+
+    Empty API_TOKEN disables the check (local dev). When set, callers must send
+    `Authorization: Bearer <token>`; compared in constant time.
+    """
+    if request.url.path == "/health":
+        return
+    expected = config.API_TOKEN
+    if not expected:
+        return  # auth disabled (dev only)
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if not hmac.compare_digest(auth[7:], expected):
+        raise HTTPException(status_code=403, detail="invalid token")
+
+
+app = FastAPI(
+    title="ai-multi-agent orchestrator",
+    version="0.1.0",
+    dependencies=[Depends(_require_token)],
+)
+
+if not config.API_TOKEN:
+    log.warning("ORCH_API_TOKEN is empty: orchestrator auth DISABLED (dev only). "
+                "Set ORCH_API_TOKEN before any multi-machine deployment.")
 
 
 @app.on_event("startup")
@@ -32,28 +62,42 @@ def _startup() -> None:
     db.init_db()
 
 
-# ---- catalog (6 AI agents) ------------------------------------------------
+# ---- catalog (units grouped by category) ----------------------------------
+# Every unit runs through the same Celery/agent path (type stays "ai_agent").
+# `category` groups them in the builder: "ai_agent" (prompt runner) vs "parser"
+# (code tools that parse data).
 
-_AGENT_META = {
-    "parser": "Parse raw request into structured form",
-    "planner": "Build a step-by-step plan from parsed input",
-    "execution": "Execute the planned actions",
-    "verification": "Verify execution results",
-    "report": "Produce a report from results",
-    "self_healing": "Detect and recover from failures",
-}
+_UNITS = [
+    {
+        "id": "ai_agent",
+        "name": "AI Agent",
+        "category": "ai_agent",
+        "description": "Run a prompt. Configure a system prompt and a user prompt.",
+        "outputSchema": {"type": "object", "additionalProperties": True},
+    },
+    {
+        "id": "excel_reader",
+        "name": "Excel Reader",
+        "category": "parser",
+        "description": "Read an Excel file into rows. Configure file path and sheet.",
+        "outputSchema": {"type": "object", "additionalProperties": True},
+    },
+]
+
+_UNIT_IDS = {u["id"] for u in _UNITS}
 
 
 def _catalog() -> list[dict[str, Any]]:
     out = []
-    for name, desc in _AGENT_META.items():
+    for u in _UNITS:
         out.append({
-            "id": name,
-            "name": name.replace("_", " ").title(),
+            "id": u["id"],
+            "name": u["name"],
             "type": "ai_agent",
-            "description": desc,
+            "category": u["category"],
+            "description": u["description"],
             "inputSchema": {"type": "object", "additionalProperties": True},
-            "outputSchema": {"type": "object", "additionalProperties": True},
+            "outputSchema": u["outputSchema"],
             "configurable": True,
         })
     return out
@@ -78,11 +122,19 @@ def agents():
 
 @app.post("/runs")
 def create_run(req: CreateRunRequest):
+    # Validate every ai_agent step's unitId. The engine dispatches non-automation
+    # steps via send_task(f"node.{unitId}"); an unknown unitId would be an
+    # attacker-controlled task name. automation_tool units are validated remotely
+    # by automation-server on /invoke.
+    for s in req.steps:
+        if s.unitType == "ai_agent" and s.unitId not in _UNIT_IDS:
+            raise HTTPException(status_code=400,
+                                detail=f"unknown ai_agent unitId: {s.unitId}")
     run_id = engine.create_run(req)
     return {"runId": run_id}
 
 
-@app.get("/runs/{run_id}")
+@app.get("/runs/{run_id}", response_model=RunView)
 def get_run(run_id: str):
     run = engine.get_run(run_id)
     if run is None:
@@ -146,43 +198,3 @@ async def run_events(run_id: str, request: Request):
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
                                       "X-Accel-Buffering": "no"})
-
-
-# ---- single-unit invoke (contract parity with automation-server) ----------
-
-def _single_step_run(unit_id: str, input_obj: dict[str, Any],
-                     cfg: dict[str, Any] | None) -> str:
-    step = StepSpec(
-        stepKey=unit_id,
-        unitId=unit_id,
-        unitType="ai_agent",
-        source="ai",
-        config=cfg or {},
-    )
-    req = CreateRunRequest(input=input_obj, steps=[step])
-    return engine.create_run(req)
-
-
-@app.post("/invoke")
-def invoke(req: InvokeRequest):
-    if req.unitId not in _AGENT_META:
-        raise HTTPException(status_code=404, detail=f"unknown unitId: {req.unitId}")
-    run_id = _single_step_run(req.unitId, req.input, req.config)
-    return {"runId": run_id}
-
-
-@app.get("/invoke/{run_id}")
-def invoke_result(run_id: str):
-    run = engine.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail="unknown runId")
-    steps = db.get_steps(run_id)
-    step = steps[0] if steps else None
-    status_map = {"running": "running", "paused_for_human": "running",
-                  "done": "done", "failed": "failed"}
-    return {
-        "status": status_map.get(run.status, run.status),
-        "input": step["input"] if step else None,
-        "output": step["output"] if step else None,
-        "done": run.status == R_DONE,
-    }
