@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { eq, asc } from "drizzle-orm";
 import { db, schema } from "@/db";
-import { AI_MULTI_AGENT_URL } from "@/lib/services";
+import { AI_MULTI_AGENT_URL, orchHeaders } from "@/lib/services";
 
 export const dynamic = "force-dynamic";
 
@@ -10,6 +10,7 @@ export const dynamic = "force-dynamic";
 export async function POST(req: NextRequest) {
   const body = (await req.json()) as {
     workflowId: string;
+    sessionId?: string;
     input?: Record<string, unknown>;
   };
   if (!body.workflowId) {
@@ -35,7 +36,6 @@ export async function POST(req: NextRequest) {
       unitType: s.unitType,
       source: s.source,
       promptTemplate: s.promptTemplate ?? undefined,
-      contextMapping: s.contextMapping ?? {},
       dependsOn: s.dependsOn ?? [],
       humanInvolved: s.humanInvolved,
       maxAttempts: s.maxAttempts,
@@ -46,7 +46,7 @@ export async function POST(req: NextRequest) {
 
   const r = await fetch(`${AI_MULTI_AGENT_URL}/runs`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: orchHeaders({ "content-type": "application/json" }),
     body: JSON.stringify(payload),
     cache: "no-store",
   });
@@ -61,6 +61,8 @@ export async function POST(req: NextRequest) {
 
   await db.insert(schema.workflowRuns).values({
     workflowId: body.workflowId,
+    sessionId: body.sessionId ?? null,
+    input: body.input ?? {},
     orchestratorRunId: runId,
     status: "running",
   });

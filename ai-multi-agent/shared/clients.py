@@ -9,6 +9,12 @@ import httpx
 from shared import config
 
 
+def _auth_headers() -> dict[str, str]:
+    """Bearer header for automation-server. Empty token => no header (dev)."""
+    tok = config.AUTOMATION_API_TOKEN
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
 def automation_invoke(unit_id: str, input_obj: dict[str, Any], cfg: dict[str, Any] | None = None,
                       timeout_sec: float = 30.0) -> dict[str, Any]:
     """Invoke an automation tool and poll until done or timeout.
@@ -16,7 +22,7 @@ def automation_invoke(unit_id: str, input_obj: dict[str, Any], cfg: dict[str, An
     Returns the final result dict: { status, input, output, done }.
     """
     base = config.AUTOMATION_SERVER_URL.rstrip("/")
-    with httpx.Client(timeout=10.0) as client:
+    with httpx.Client(timeout=10.0, headers=_auth_headers()) as client:
         r = client.post(f"{base}/invoke", json={"unitId": unit_id, "input": input_obj, "config": cfg or {}})
         r.raise_for_status()
         run_id = r.json()["runId"]

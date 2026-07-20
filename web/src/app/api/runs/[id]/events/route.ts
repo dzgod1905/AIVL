@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { AI_MULTI_AGENT_URL } from "@/lib/services";
+import { AI_MULTI_AGENT_URL, orchHeaders } from "@/lib/services";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -10,7 +10,7 @@ export async function GET(
   { params }: { params: { id: string } },
 ) {
   const upstream = await fetch(`${AI_MULTI_AGENT_URL}/runs/${params.id}/events`, {
-    headers: { accept: "text/event-stream" },
+    headers: orchHeaders({ accept: "text/event-stream" }),
     signal: req.signal,
     cache: "no-store",
   });

@@ -18,15 +18,15 @@ celery_app = Celery(
     "ai_multi_agent",
     broker=config.REDIS_URL,
     backend=config.REDIS_URL,
-    include=["agents.tasks"],
+    include=["node.registry"],
 )
 
-# One named queue per agent.
+# One named queue per unit.
 celery_app.conf.task_queues = [Queue(q) for q in config.AGENTS.values()]
 
-# Route each agent task name (agents.<name>) to its queue.
+# Route each unit task name (node.<name>) to its queue.
 celery_app.conf.task_routes = {
-    f"agents.{name}": {"queue": queue} for name, queue in config.AGENTS.items()
+    f"node.{name}": {"queue": queue} for name, queue in config.AGENTS.items()
 }
 
 celery_app.conf.update(
@@ -48,9 +48,11 @@ if os.getenv("CELERY_EAGER") == "1":
     def _local_send_task(name, args=None, **kwargs):
         # task_always_eager does not cover send_task(), so route by name to the
         # registered task and run it synchronously via .apply().
-        from agents.tasks import TASK_BY_AGENT  # lazy: avoids import cycle
+        from node.registry import TASK_BY_AGENT  # lazy: avoids import cycle
 
         agent = name.split(".")[-1]
-        return TASK_BY_AGENT[agent].apply(args=args or [])
+        # unknown unitId (e.g. an old seeded workflow) -> generic ai_agent task
+        task = TASK_BY_AGENT.get(agent) or TASK_BY_AGENT["ai_agent"]
+        return task.apply(args=args or [])
 
     celery_app.send_task = _local_send_task  # type: ignore[method-assign]

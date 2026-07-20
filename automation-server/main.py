@@ -6,14 +6,45 @@ simulated delay.
 """
 from __future__ import annotations
 
+import hmac
+import logging
+import os
 import time
 import uuid
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="automation-server (dummy)", version="0.1.0")
+log = logging.getLogger("automation-server")
+
+# Shared-secret bearer token. Empty => auth DISABLED (local dev only). Must be
+# set (matching the orchestrator's AUTOMATION_API_TOKEN) in any deployment where
+# the orchestrator and automation-server run on different machines.
+_API_TOKEN = os.getenv("AUTOMATION_API_TOKEN", "").strip()
+
+
+def _require_token(request: Request) -> None:
+    if request.url.path == "/health":
+        return
+    if not _API_TOKEN:
+        return  # auth disabled (dev only)
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    if not hmac.compare_digest(auth[7:], _API_TOKEN):
+        raise HTTPException(status_code=403, detail="invalid token")
+
+
+app = FastAPI(
+    title="automation-server (dummy)",
+    version="0.1.0",
+    dependencies=[Depends(_require_token)],
+)
+
+if not _API_TOKEN:
+    log.warning("AUTOMATION_API_TOKEN is empty: automation-server auth DISABLED "
+                "(dev only). Set it before any multi-machine deployment.")
 
 # ---- catalog seed ---------------------------------------------------------
 

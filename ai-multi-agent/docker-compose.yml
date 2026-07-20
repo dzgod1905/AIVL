@@ -1,0 +1,91 @@
+# ai-multi-agent stack (deployable on its own machine).
+# Contains: redis (broker/backend), orchestrator-db (Postgres), api, workers.
+# The automation-server runs as a SEPARATE stack (see ../automation-server).
+#
+# Reads variables from a `.env` file in THIS directory (copy .env.example).
+# Required: REDIS_PASSWORD, ORCH_DB_PASSWORD, ORCH_API_TOKEN,
+#           AUTOMATION_API_TOKEN, AUTOMATION_SERVER_URL.
+#
+# Security notes:
+# - redis and orchestrator-db publish NO host port (reachable only inside the
+#   compose network). Never expose 6379 to a LAN/internet.
+# - api publishes 8001 bound to API_BIND (default 127.0.0.1 = localhost only).
+#   To let another machine (the web host) reach it, set API_BIND=0.0.0.0 AND
+#   protect the path with the bearer token + a firewall / private overlay
+#   (Tailscale/WireGuard). See docs/security.md.
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}"]
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  orchestrator-db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=orch
+      - POSTGRES_PASSWORD=${ORCH_DB_PASSWORD:?set ORCH_DB_PASSWORD}
+      - POSTGRES_DB=orchestrator
+    volumes:
+      - orch-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orch -d orchestrator"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    ports:
+      - "${API_BIND:-127.0.0.1}:8001:8001"
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - ORCH_DATABASE_URL=postgresql://orch:${ORCH_DB_PASSWORD}@orchestrator-db:5432/orchestrator
+      - SQLITE_PATH=/data/orchestrator.db
+      - AUTOMATION_SERVER_URL=${AUTOMATION_SERVER_URL:?set AUTOMATION_SERVER_URL}
+      - ORCH_API_TOKEN=${ORCH_API_TOKEN:?set ORCH_API_TOKEN}
+      - AUTOMATION_API_TOKEN=${AUTOMATION_API_TOKEN:?set AUTOMATION_API_TOKEN}
+      # Optional: real ai_agent LLM calls (empty => dummy). Eager path runs here.
+      - AI_AGENT_KEYS=${AI_AGENT_KEYS:-}
+    volumes:
+      - agent-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator-db:
+        condition: service_healthy
+    command: ["uvicorn", "orchestrator.app:app", "--host", "0.0.0.0", "--port", "8001"]
+
+  workers:
+    build: .
+    environment:
+      # Workers only run agent tasks (ai_agent, excel_reader). They talk to
+      # redis + the DB; they never serve HTTP nor call automation-server.
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - ORCH_DATABASE_URL=postgresql://orch:${ORCH_DB_PASSWORD}@orchestrator-db:5432/orchestrator
+      - SQLITE_PATH=/data/orchestrator.db
+      - WORKER_CONCURRENCY=6
+      # Optional: real ai_agent LLM calls (empty => dummy). Broker path runs here.
+      - AI_AGENT_KEYS=${AI_AGENT_KEYS:-}
+    volumes:
+      - agent-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator-db:
+        condition: service_healthy
+    # One container, all agent queues, concurrency>1 -> visible parallelism.
+    # Queues MUST match config.AGENTS values (one queue per unit).
+    command: >
+      celery -A shared.celery_app.celery_app worker
+      -Q queue:ai_agent,queue:excel_reader
+      --concurrency=6 --loglevel=info
+
+volumes:
+  agent-data:
+  orch-db-data:

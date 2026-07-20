@@ -56,7 +56,6 @@ export async function POST(req: NextRequest) {
       unitType: s.unitType,
       source: s.source,
       promptTemplate: s.promptTemplate ?? null,
-      contextMapping: s.contextMapping ?? {},
       apiConfig: s.config ?? {},
       dependsOn: s.dependsOn ?? [],
       humanInvolved: s.humanInvolved ?? false,

@@ -9,6 +9,7 @@ __pycache__/
 # Node / Next
 node_modules/
 .next/
+*.tsbuildinfo
 .env
 .env.local
 
