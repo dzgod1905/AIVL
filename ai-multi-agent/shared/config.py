@@ -38,6 +38,12 @@ DEFAULT_MAX_ATTEMPTS = int(os.getenv("DEFAULT_MAX_ATTEMPTS", "5"))
 # Delay between re-asks when an agent reports done=false.
 REASK_DELAY_SEC = float(os.getenv("REASK_DELAY_SEC", "0.5"))
 
+
+# Whole-run (session) concurrency gate in the orchestrator engine (API process).
+# 1 = one run at a time: run B does not start its first step until run A fully
+# terminates (done/failed). Distinct from WORKER_CONCURRENCY (celery task pool).
+RUN_CONCURRENCY = max(1, int(os.getenv("RUN_CONCURRENCY", "1")))
+
 # Simulated work time for the dummy AI Agent (seconds, per attempt).
 AI_AGENT_DELAY_SEC = float(os.getenv("AI_AGENT_DELAY_SEC", "20"))
 
