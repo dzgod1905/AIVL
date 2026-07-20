@@ -50,6 +50,9 @@ services:
       - AUTOMATION_SERVER_URL=${AUTOMATION_SERVER_URL:?set AUTOMATION_SERVER_URL}
       - ORCH_API_TOKEN=${ORCH_API_TOKEN:?set ORCH_API_TOKEN}
       - AUTOMATION_API_TOKEN=${AUTOMATION_API_TOKEN:?set AUTOMATION_API_TOKEN}
+      # Whole-run (session) gate. 1 = one run at a time (session A fully done
+      # before B starts). The engine runs in THIS api process, so set it here.
+      - RUN_CONCURRENCY=${RUN_CONCURRENCY:-1}
       # Optional: real ai_agent LLM calls (empty => dummy). Eager path runs here.
       - AI_AGENT_KEYS=${AI_AGENT_KEYS:-}
     volumes:
@@ -69,7 +72,7 @@ services:
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
       - ORCH_DATABASE_URL=postgresql://orch:${ORCH_DB_PASSWORD}@orchestrator-db:5432/orchestrator
       - SQLITE_PATH=/data/orchestrator.db
-      - WORKER_CONCURRENCY=6
+      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-1}
       # Optional: real ai_agent LLM calls (empty => dummy). Broker path runs here.
       - AI_AGENT_KEYS=${AI_AGENT_KEYS:-}
     volumes:
@@ -84,7 +87,7 @@ services:
     command: >
       celery -A shared.celery_app.celery_app worker
       -Q queue:ai_agent,queue:excel_reader
-      --concurrency=6 --loglevel=info
+      --concurrency=${WORKER_CONCURRENCY:-1} --loglevel=info
 
 volumes:
   agent-data:

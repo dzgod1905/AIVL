@@ -115,3 +115,55 @@ curl http://<machine-B>:8002/health     # {"ok":true}
 
 `/health` needs no token. Any other path returns 401/403 without a valid bearer
 token once tokens are set.
+
+## Online: full backend on a free VM + web on Vercel (Option A)
+
+Keeps the architecture unchanged (full broker stack: redis + orchestrator-db +
+automation-server + api + workers). Backend runs on one always-on VM; the web app
+runs on Vercel and reaches the orchestrator over HTTPS.
+
+### 1. VM (free / cheap, always-on)
+
+- Oracle Cloud "Always Free" (ARM Ampere, up to 4 vCPU / 24 GB, free forever) is
+  the roomiest free option; any small VPS (Hetzner/DO) works too. e2-micro (1 GB)
+  is tight for five containers.
+- Ubuntu, then:
+
+```bash
+curl -fsSL https://get.docker.com | sh
+git clone https://github.com/dzgod1905/AIVL.git && cd AIVL
+cp .env.example .env
+# fill: REDIS_PASSWORD, ORCH_DB_PASSWORD, ORCH_API_TOKEN, AUTOMATION_API_TOKEN
+#       (openssl rand -hex 32 each), AI_AGENT_KEYS=[...], WORKER_CONCURRENCY=1
+docker compose up -d --build
+```
+
+Full stack runs. `WORKER_CONCURRENCY` controls worker parallelism (1 = serial,
+higher = that many concurrent agent tasks).
+
+### 2. Expose the orchestrator over HTTPS (Cloudflare Tunnel)
+
+No firewall port opened; cloudflared dials out to Cloudflare's edge.
+
+1. Cloudflare Zero Trust > Networks > Tunnels > Create a tunnel (named).
+2. Public Hostname (e.g. `orch.yourdomain`) -> Service `http://ai-multi-agent-api:8001`.
+3. Put the tunnel token in `.env` as `TUNNEL_TOKEN`.
+4. `docker compose --profile tunnel up -d`
+
+Keep `API_BIND=127.0.0.1` (nothing published to the host; the tunnel reaches the
+API on the internal Compose network). Quick alternative for a first test: set
+`API_BIND=0.0.0.0`, open the VM firewall on 8001, and use `http://VM_IP:8001` -
+but the bearer token then travels over plain HTTP, so use a throwaway token and
+switch to the tunnel before anything real.
+
+### 3. Web on Vercel
+
+New Project > import the repo, Root Directory `web`, then set env:
+
+```
+DATABASE_URL       = <Neon connection string>
+AI_MULTI_AGENT_URL = https://orch.yourdomain      # the tunnel hostname
+ORCH_API_TOKEN     = <exactly the ORCH_API_TOKEN from the VM .env>
+```
+
+The web -> orchestrator token must match, or every call returns 401.

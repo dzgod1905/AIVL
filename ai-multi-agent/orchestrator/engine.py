@@ -68,6 +68,10 @@ class Engine:
         # agent name -> count of in-flight tasks (busy if > 0)
         self.agent_inflight: dict[str, int] = {a: 0 for a in config.AGENTS}
         self._agent_lock = threading.Lock()
+        # Whole-run gate: only RUN_CONCURRENCY runs may execute steps at once.
+        # With 1, run B blocks here until run A fully terminates (done/failed),
+        # so entire sessions run one-at-a-time instead of interleaving steps.
+        self._run_slots = threading.Semaphore(config.RUN_CONCURRENCY)
 
     # ---- agent busy/idle bookkeeping -------------------------------------
 
@@ -121,8 +125,15 @@ class Engine:
         Sequential by design - the next step starts only after the current one is
         `done`. Parallelism lives BETWEEN runs (many loops + the worker pool), not
         inside a single run.
+
+        Gated by self._run_slots (config.RUN_CONCURRENCY): with 1, this loop waits
+        for its whole-run slot before the first step, so run B does not interleave
+        with run A - A finishes entirely, then B begins. Slot is released on every
+        exit path (done / failed / crash).
         """
+        self._run_slots.acquire()
         try:
+          try:
             for step_key in run.order:
                 with run.cond:
                     if run.status == R_FAILED:
@@ -147,12 +158,14 @@ class Engine:
                 run.status = R_DONE
                 db.set_run_status(run.id, R_DONE)
             self._emit(run, {"type": "run_status", "status": R_DONE})
-        except Exception as exc:  # pragma: no cover - safety net
+          except Exception as exc:  # pragma: no cover - safety net
             log.exception("run loop crashed: %s", exc)
             with run.cond:
                 run.status = R_FAILED
                 db.set_run_status(run.id, R_FAILED)
             self._emit(run, {"type": "run_status", "status": R_FAILED, "reason": str(exc)})
+        finally:
+            self._run_slots.release()
 
     # ---- step execution ---------------------------------------------------
 
