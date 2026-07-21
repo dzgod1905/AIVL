@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { eq, asc } from "drizzle-orm";
+import { eq, asc, and, ne } from "drizzle-orm";
 import { db, schema } from "@/db";
 import { hasCycle } from "@/lib/graph";
 import type { StepDef } from "@/lib/types";
@@ -32,7 +32,8 @@ export async function PUT(
   { params }: { params: { id: string } },
 ) {
   const body = (await req.json()) as { name: string; steps: StepDef[] };
-  if (!body.name || !Array.isArray(body.steps) || body.steps.length === 0) {
+  const name = (body.name ?? "").trim();
+  if (!name || !Array.isArray(body.steps) || body.steps.length === 0) {
     return NextResponse.json({ error: "name and steps required" }, { status: 400 });
   }
 
@@ -41,6 +42,18 @@ export async function PUT(
     .from(schema.workflows)
     .where(eq(schema.workflows.id, params.id));
   if (!wf) return NextResponse.json({ error: "not found" }, { status: 404 });
+
+  // reject a name already taken by a DIFFERENT workflow
+  const [dup] = await db
+    .select({ id: schema.workflows.id })
+    .from(schema.workflows)
+    .where(and(eq(schema.workflows.name, name), ne(schema.workflows.id, params.id)));
+  if (dup) {
+    return NextResponse.json(
+      { error: `a workflow named "${name}" already exists` },
+      { status: 409 },
+    );
+  }
 
   const keys = body.steps.map((s) => s.stepKey);
   if (new Set(keys).size !== keys.length) {
@@ -62,7 +75,7 @@ export async function PUT(
   }
 
   await db.update(schema.workflows)
-    .set({ name: body.name })
+    .set({ name })
     .where(eq(schema.workflows.id, params.id));
 
   // replace steps

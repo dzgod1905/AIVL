@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir \
 COPY shared ./shared
 COPY node ./node
 COPY orchestrator ./orchestrator
+COPY worker.sh ./worker.sh
 # Default: run the orchestrator API. Workers override CMD in docker-compose.
 EXPOSE 8001
 CMD ["uvicorn", "orchestrator.app:app", "--host", "0.0.0.0", "--port", "8001"]

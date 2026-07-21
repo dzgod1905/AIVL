@@ -39,17 +39,15 @@ DEFAULT_MAX_ATTEMPTS = int(os.getenv("DEFAULT_MAX_ATTEMPTS", "5"))
 REASK_DELAY_SEC = float(os.getenv("REASK_DELAY_SEC", "0.5"))
 
 
-# Whole-run (session) concurrency gate in the orchestrator engine (API process).
-# 1 = one run at a time: run B does not start its first step until run A fully
-# terminates (done/failed). Distinct from WORKER_CONCURRENCY (celery task pool).
-RUN_CONCURRENCY = max(1, int(os.getenv("RUN_CONCURRENCY", "1")))
-
-# Simulated work time for the dummy AI Agent (seconds, per attempt).
-AI_AGENT_DELAY_SEC = float(os.getenv("AI_AGENT_DELAY_SEC", "20"))
-
-# Simulated work time for the Excel Reader (seconds, per attempt). Makes the
-# node visibly "busy" in the DAG panel while testing.
-EXCEL_READER_DELAY_SEC = float(os.getenv("EXCEL_READER_DELAY_SEC", "20"))
+# Orchestrator concurrency gates (they live in the engine, i.e. the API process).
+# Two independent knobs, both keyed by workflow:
+#   SESSION_CONCURRENCY  : parallel sessions (runs) allowed WITHIN one workflow.
+#   WORKFLOW_CONCURRENCY : how many DISTINCT workflows may run at the same time.
+# Global cap on concurrently executing runs = SESSION_CONCURRENCY * WORKFLOW_CONCURRENCY.
+# The Celery worker pool (worker.sh --concurrency) must be >= that product or the
+# pool, not these gates, becomes the real bottleneck.
+SESSION_CONCURRENCY = max(1, int(os.getenv("SESSION_CONCURRENCY", "1")))
+WORKFLOW_CONCURRENCY = max(1, int(os.getenv("WORKFLOW_CONCURRENCY", "1")))
 
 # ---- real LLM calls (optional) --------------------------------------------
 # If at least one usable key is configured in AI_AGENT_KEYS, ai_agent makes a
@@ -115,10 +113,6 @@ def _load_agent_keys() -> list[dict]:
 # Parsed once at import. Empty list => ai_agent stays dummy.
 AI_AGENT_KEYS: list[dict] = _load_agent_keys()
 
-# Catalog units, grouped by category for the builder. name -> queue.
-# ai_agent  : runs a prompt (system + user) from config.
-# excel_reader (parser): reads an Excel file into rows.
-AGENTS = {
-    "ai_agent": "queue:ai_agent",
-    "excel_reader": "queue:excel_reader",
-}
+# NB: the unit list and their queues are no longer declared here. They are derived
+# from each tool's SPEC in node/registry.py (UNIT_IDS, QUEUES); queue routing is
+# derived from the task name in shared/celery_app.py. See docs/adding-a-tool.md.

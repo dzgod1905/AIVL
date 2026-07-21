@@ -1,6 +1,21 @@
 export type UnitType = "ai_agent" | "automation_tool";
 export type UnitSource = "ai" | "automation";
 
+// A user-configurable setting a tool declares in its Python SPEC["params"].
+// The builder renders these generically, so adding a tool never needs UI edits.
+export interface ParamSpec {
+  key: string;
+  label: string;
+  type: "string" | "text" | "number" | "boolean" | "enum";
+  default: unknown;
+  // required = always shown, cannot be removed (fixed row). optional = added via
+  // the "+ Add setting" row picker and removable.
+  required?: boolean;
+  placeholder?: string;
+  description?: string;
+  options?: string[]; // enum only
+}
+
 export interface CatalogUnit {
   id: string;
   name: string;
@@ -9,6 +24,7 @@ export interface CatalogUnit {
   description: string;
   inputSchema: Record<string, unknown>;
   outputSchema: Record<string, unknown>;
+  params: ParamSpec[]; // from each tool's SPEC; drives the generic config UI
   configurable: boolean;
   source: UnitSource; // added by /api/catalog
 }

@@ -134,12 +134,15 @@ curl -fsSL https://get.docker.com | sh
 git clone https://github.com/dzgod1905/AIVL.git && cd AIVL
 cp .env.example .env
 # fill: REDIS_PASSWORD, ORCH_DB_PASSWORD, ORCH_API_TOKEN, AUTOMATION_API_TOKEN
-#       (openssl rand -hex 32 each), AI_AGENT_KEYS=[...], WORKER_CONCURRENCY=1
+#       (openssl rand -hex 32 each), AI_AGENT_KEYS=[...],
+#       SESSION_CONCURRENCY=1, WORKFLOW_CONCURRENCY=1
 docker compose up -d --build
 ```
 
-Full stack runs. `WORKER_CONCURRENCY` controls worker parallelism (1 = serial,
-higher = that many concurrent agent tasks).
+Full stack runs. Two concurrency gates control parallelism: `SESSION_CONCURRENCY`
+(parallel sessions within one workflow) and `WORKFLOW_CONCURRENCY` (distinct
+workflows at once). The worker sizes its Celery pool to their product, so the pool
+never bottlenecks the gates. 1/1 = fully serial.
 
 ### 2. Expose the orchestrator over HTTPS (Cloudflare Tunnel)
 

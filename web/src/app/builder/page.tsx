@@ -1,12 +1,16 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { CatalogUnit, StepDef } from "@/lib/types";
+import type { CatalogUnit, ParamSpec, StepDef } from "@/lib/types";
 
 const CATEGORY_LABEL: Record<string, string> = {
   ai_agent: "AI Agent",
   parser: "Parser",
 };
+
+// Re-ask limit and per-step timeout are fixed in code, not user-configurable.
+const STEP_MAX_ATTEMPTS = 5;
+const STEP_TIMEOUT_SEC = 30;
 
 function categoryLabel(c: string): string {
   return CATEGORY_LABEL[c] ?? c;
@@ -48,6 +52,14 @@ export default function BuilderPage() {
     return m;
   }, [catalog]);
 
+  // unitId -> declared config params (from each tool's SPEC), for the generic
+  // param editor. Not persisted in the DB; looked up from the catalog by unitId.
+  const paramsByUnit = useMemo(() => {
+    const m: Record<string, ParamSpec[]> = {};
+    for (const u of catalog) m[u.id] = u.params ?? [];
+    return m;
+  }, [catalog]);
+
   // load an existing workflow once, after the catalog is available
   useEffect(() => {
     if (!editId || catalog.length === 0 || loadedRef.current) return;
@@ -68,6 +80,26 @@ export default function BuilderPage() {
         };
         const loaded: StepDef[] = (d.steps as Row[]).map((s) => {
           const category = catByUnit[s.unitId] ?? "ai_agent";
+          // Legacy ai_agent steps stored the user prompt in promptTemplate; the
+          // builder now edits it as the user_prompt param. Migrate on load.
+          let config = s.apiConfig ?? {};
+          if (category === "ai_agent" && s.promptTemplate && config.user_prompt === undefined) {
+            config = { ...config, user_prompt: s.promptTemplate };
+          }
+          // legacy split session flags -> one `session` flag
+          if (config.session === undefined && (config.session_text || config.session_file)) {
+            config = { ...config, session: true };
+          }
+          if ("session_text" in config || "session_file" in config) {
+            const { session_text: _t, session_file: _f, ...rest } = config;
+            config = rest;
+          }
+          // ensure required params (always-present rows) carry a value
+          for (const p of paramsByUnit[s.unitId] ?? []) {
+            if (p.required && !(p.key in config)) {
+              config = { ...config, [p.key]: paramDefault(p) };
+            }
+          }
           return {
             id: crypto.randomUUID(),
             stepKey: s.stepKey,
@@ -75,25 +107,31 @@ export default function BuilderPage() {
             unitType: s.unitType,
             source: s.source,
             category,
-            promptTemplate: s.promptTemplate ?? (category === "ai_agent" ? "" : undefined),
+            promptTemplate: category === "ai_agent" ? "" : undefined,
             dependsOn: s.dependsOn ?? [],
             humanInvolved: s.humanInvolved,
-            maxAttempts: s.maxAttempts,
-            timeoutSec: s.timeoutSec,
-            config: s.apiConfig ?? {},
+            maxAttempts: STEP_MAX_ATTEMPTS,
+            timeoutSec: STEP_TIMEOUT_SEC,
+            config,
           };
         });
         setSteps(loaded);
         setSelectedId(loaded[0]?.id ?? null);
       })
       .catch(() => setMsg("Failed to load workflow"));
-  }, [editId, catalog, catByUnit]);
+  }, [editId, catalog, catByUnit, paramsByUnit]);
 
   const stepKeys = useMemo(() => steps.map((s) => s.stepKey), [steps]);
 
   function addUnit(u: CatalogUnit) {
     const stepKey = slugKey(u.id, stepKeys);
     const isAgent = u.category === "ai_agent";
+    // required params are always present -> seed them with their defaults so the
+    // config carries them from the start (they cannot be added/removed later).
+    const config: Record<string, unknown> = {};
+    for (const p of u.params ?? []) {
+      if (p.required) config[p.key] = paramDefault(p);
+    }
     const newStep: StepDef = {
       id: crypto.randomUUID(),
       stepKey,
@@ -104,9 +142,9 @@ export default function BuilderPage() {
       promptTemplate: isAgent ? "" : undefined,
       dependsOn: [],
       humanInvolved: false,
-      maxAttempts: 5,
-      timeoutSec: 30,
-      config: {},
+      maxAttempts: STEP_MAX_ATTEMPTS,
+      timeoutSec: STEP_TIMEOUT_SEC,
+      config,
     };
     setSteps((s) => [...s, newStep]);
     setSelectedId(newStep.id);
@@ -208,6 +246,7 @@ export default function BuilderPage() {
                 step={s}
                 idx={idx}
                 priorSteps={steps.slice(0, idx)}
+                params={paramsByUnit[s.unitId] ?? []}
                 onChange={(patch) => update(idx, patch)}
                 onRemove={() => remove(idx)}
               />
@@ -556,6 +595,11 @@ type Variable = { ref: string; label: string; hint: string };
 function variablesFor(step: StepDef, priorSteps: StepDef[]): Variable[] {
   const depSet = new Set(step.dependsOn);
   const out: Variable[] = [];
+  // session (the chat text/file) is insertable into prompts when enabled
+  if (step.config?.session) {
+    out.push({ ref: "session.text", label: "session.text", hint: "typed request text" });
+    out.push({ ref: "session.file", label: "session.file", hint: "uploaded file name" });
+  }
   for (const dep of priorSteps) {
     if (!depSet.has(dep.stepKey)) continue;
     out.push({ ref: `${dep.stepKey}.output`, label: `${dep.stepKey}.output`, hint: "full output" });
@@ -576,23 +620,250 @@ function variablesFor(step: StepDef, priorSteps: StepDef[]): Variable[] {
   return out;
 }
 
+function paramDefault(p: ParamSpec): unknown {
+  return p.default ?? (p.type === "boolean" ? false : p.type === "number" ? 0 : "");
+}
+
+/** Value cell for one param row, rendered by the param's type. Text params get a
+ * textarea and report focus so the {{variable}} buttons can target them. */
+function ParamValue({
+  p,
+  value,
+  onValue,
+  onFocusText,
+}: {
+  p: ParamSpec;
+  value: unknown;
+  onValue: (v: unknown) => void;
+  onFocusText: (el: HTMLTextAreaElement, key: string) => void;
+}) {
+  if (p.type === "boolean") {
+    return (
+      <label className="row" style={{ margin: 0 }}>
+        <input
+          type="checkbox"
+          style={{ width: "auto" }}
+          checked={!!value}
+          onChange={(e) => onValue(e.target.checked)}
+        />
+        <span className="muted">on</span>
+      </label>
+    );
+  }
+  if (p.type === "enum") {
+    return (
+      <select value={String(value ?? "")} onChange={(e) => onValue(e.target.value)}>
+        {(p.options ?? []).map((opt) => (
+          <option key={opt} value={opt}>{opt}</option>
+        ))}
+      </select>
+    );
+  }
+  if (p.type === "text") {
+    return (
+      <textarea
+        value={value === undefined || value === null ? "" : String(value)}
+        placeholder={p.placeholder ?? ""}
+        style={{ minHeight: 48, width: "100%" }}
+        onFocus={(e) => onFocusText(e.currentTarget, p.key)}
+        onChange={(e) => onValue(e.target.value)}
+      />
+    );
+  }
+  return (
+    <input
+      type={p.type === "number" ? "number" : "text"}
+      value={value === undefined || value === null ? "" : String(value)}
+      placeholder={p.placeholder ?? ""}
+      style={{ width: "100%" }}
+      onChange={(e) =>
+        onValue(p.type === "number" ? (e.target.value === "" ? "" : Number(e.target.value)) : e.target.value)
+      }
+    />
+  );
+}
+
+/** Config editor with two kinds of params:
+ *  - required: always shown as fixed rows (no picker, no Remove). Seeded with
+ *    their default when the step is created / loaded.
+ *  - optional: added via the "+ Add setting" row (a picker dropdown + value +
+ *    Remove). Rows are the optional params currently present in `cfg`, so
+ *    add/remove/switch just writes/clears a config key (no hidden local state).
+ * For ai_agent, user_prompt is a required param; system_prompt is optional. */
+function ParamEditor({
+  params,
+  cfg,
+  onChange,
+  variables,
+}: {
+  params: ParamSpec[];
+  cfg: Record<string, unknown>;
+  onChange: (nextCfg: Record<string, unknown>) => void; // full replace
+  variables: Variable[];
+}) {
+  const lastFocused = useRef<{ el: HTMLTextAreaElement; key: string } | null>(null);
+
+  if (params.length === 0) return null;
+
+  const required = params.filter((p) => p.required);
+  const optional = params.filter((p) => !p.required);
+  const activeOptional = optional.filter((p) => p.key in cfg); // declaration order
+  const usedKeys = new Set(activeOptional.map((p) => p.key));
+  const unused = optional.filter((p) => !usedKeys.has(p.key));
+  const byKey = (k: string) => optional.find((p) => p.key === k);
+
+  // text params that can receive a {{variable}} insert (required are always here)
+  const textParams = [...required, ...activeOptional].filter((p) => p.type === "text");
+
+  function addRow() {
+    const p = unused[0];
+    if (p) onChange({ ...cfg, [p.key]: paramDefault(p) });
+  }
+  function removeRow(key: string) {
+    const next = { ...cfg };
+    delete next[key];
+    onChange(next);
+  }
+  function switchKey(oldKey: string, newKey: string) {
+    if (newKey === oldKey) return;
+    const p = byKey(newKey);
+    const next = { ...cfg };
+    delete next[oldKey];
+    next[newKey] = p ? paramDefault(p) : "";
+    onChange(next);
+  }
+  function setValue(key: string, v: unknown) {
+    onChange({ ...cfg, [key]: v });
+  }
+
+  function insertRef(ref: string) {
+    const token = `{{${ref}}}`;
+    const f = lastFocused.current;
+    if (f) {
+      const cur = String(cfg[f.key] ?? "");
+      const start = f.el.selectionStart ?? cur.length;
+      const end = f.el.selectionEnd ?? cur.length;
+      const next = cur.slice(0, start) + token + cur.slice(end);
+      setValue(f.key, next);
+      requestAnimationFrame(() => {
+        f.el.focus();
+        const pos = start + token.length;
+        f.el.setSelectionRange(pos, pos);
+      });
+      return;
+    }
+    // no textarea focused: append to the first text param present, if any
+    const firstText = textParams[0];
+    if (firstText) setValue(firstText.key, String(cfg[firstText.key] ?? "") + token);
+  }
+
+  const onFocusText = (el: HTMLTextAreaElement, key: string) =>
+    (lastFocused.current = { el, key });
+
+  return (
+    <div style={{ marginTop: 8 }}>
+      <label>Settings</label>
+
+      {variables.length > 0 && textParams.length > 0 && (
+        <div className="row" style={{ marginBottom: 6 }}>
+          <span className="muted">Insert into focused prompt:</span>
+          {variables.map((v) => (
+            <button
+              key={v.ref}
+              className="secondary"
+              title={v.hint}
+              style={{ fontFamily: "ui-monospace, monospace" }}
+              onClick={() => insertRef(v.ref)}
+            >
+              {`{{${v.label}}}`}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* required params: fixed rows, no picker, no Remove */}
+      {required.map((p) => (
+        <div
+          key={p.key}
+          style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 6 }}
+        >
+          <div style={{ flex: "0 0 180px" }}>
+            <div style={{ fontWeight: 600 }}>{p.label}</div>
+            <div className="muted">required</div>
+          </div>
+          <div style={{ flex: "1 1 0", minWidth: 0 }}>
+            <ParamValue
+              p={p}
+              value={p.key in cfg ? cfg[p.key] : paramDefault(p)}
+              onValue={(v) => setValue(p.key, v)}
+              onFocusText={onFocusText}
+            />
+            {p.description && (
+              <div className="muted" style={{ marginTop: 2 }}>{p.description}</div>
+            )}
+          </div>
+        </div>
+      ))}
+
+      {/* optional params: picker + value + Remove */}
+      {activeOptional.map((p) => {
+        const options = [p, ...unused];
+        return (
+          <div
+            key={p.key}
+            style={{ display: "flex", gap: 8, alignItems: "flex-start", marginBottom: 6 }}
+          >
+            <select
+              value={p.key}
+              style={{ flex: "0 0 180px" }}
+              onChange={(e) => switchKey(p.key, e.target.value)}
+            >
+              {options.map((o) => (
+                <option key={o.key} value={o.key}>{o.label}</option>
+              ))}
+            </select>
+            <div style={{ flex: "1 1 0", minWidth: 0 }}>
+              <ParamValue
+                p={p}
+                value={cfg[p.key]}
+                onValue={(v) => setValue(p.key, v)}
+                onFocusText={onFocusText}
+              />
+              {p.description && (
+                <div className="muted" style={{ marginTop: 2 }}>{p.description}</div>
+              )}
+            </div>
+            <button className="danger" onClick={() => removeRow(p.key)}>Remove</button>
+          </div>
+        );
+      })}
+
+      {optional.length > 0 && (
+        <button className="secondary" onClick={addRow} disabled={unused.length === 0}>
+          + Add setting
+        </button>
+      )}
+    </div>
+  );
+}
+
 function StepEditor({
   step,
   idx,
   priorSteps,
+  params,
   onChange,
   onRemove,
 }: {
   step: StepDef;
   idx: number;
   priorSteps: StepDef[];
+  params: ParamSpec[];
   onChange: (patch: Partial<StepDef>) => void;
   onRemove: () => void;
 }) {
-  const taRef = useRef<HTMLTextAreaElement>(null);
   const priorKeys = priorSteps.map((s) => s.stepKey);
   const variables = variablesFor(step, priorSteps);
-  const isAgent = step.category === "ai_agent";
   const isParser = step.category === "parser";
   const cfg = step.config ?? {};
 
@@ -605,50 +876,16 @@ function StepEditor({
     const dependsOn = has
       ? step.dependsOn.filter((d) => d !== k)
       : [...step.dependsOn, k];
-    // if a dependency is removed, drop any {{k...}} variables that no longer resolve
-    let promptTemplate = step.promptTemplate;
-    if (has && promptTemplate) {
-      promptTemplate = promptTemplate.replace(
-        new RegExp(`\\{\\{\\s*${k}(\\.[^}]*)?\\}\\}`, "g"),
-        "",
-      );
+    // if a dependency is removed, drop any {{k...}} refs from the prompt params
+    let config = step.config;
+    if (has && config) {
+      const re = new RegExp(`\\{\\{\\s*${k}(\\.[^}]*)?\\}\\}`, "g");
+      const strip = (v: unknown) => (typeof v === "string" ? v.replace(re, "") : v);
+      config = { ...config, user_prompt: strip(config.user_prompt), system_prompt: strip(config.system_prompt) };
     }
-    onChange({ dependsOn, promptTemplate });
+    onChange({ dependsOn, config });
   }
 
-  /** Insert a {{ref}} at the caret (or append) and keep focus. */
-  function insertRef(ref: string) {
-    const token = `{{${ref}}}`;
-    const ta = taRef.current;
-    const cur = step.promptTemplate ?? "";
-    if (!ta) {
-      onChange({ promptTemplate: cur + token });
-      return;
-    }
-    const start = ta.selectionStart ?? cur.length;
-    const end = ta.selectionEnd ?? cur.length;
-    const next = cur.slice(0, start) + token + cur.slice(end);
-    onChange({ promptTemplate: next });
-    requestAnimationFrame(() => {
-      ta.focus();
-      const pos = start + token.length;
-      ta.setSelectionRange(pos, pos);
-    });
-  }
-
-  // behavior preset (ai_agent only), with system_prompt/user_prompt preserved
-  const preset = cfg.stuck
-    ? "stuck"
-    : typeof cfg.simulate_incomplete === "number" && cfg.simulate_incomplete > 0
-      ? "reask"
-      : "normal";
-
-  function setPreset(p: string) {
-    const { stuck: _s, simulate_incomplete: _n, ...rest } = cfg;
-    if (p === "normal") setConfigReplace({ ...rest, simulate_incomplete: 0 });
-    else if (p === "reask") setConfigReplace({ ...rest, simulate_incomplete: 2 });
-    else if (p === "stuck") setConfigReplace({ ...rest, stuck: true });
-  }
   function setConfigReplace(next: Record<string, unknown>) {
     onChange({ config: next });
   }
@@ -670,11 +907,17 @@ function StepEditor({
         onChange={(e) => onChange({ stepKey: e.target.value })}
       />
 
-      <label>Use outputs of (adds their variables + a dashed arrow; order is unchanged)</label>
+      <label>Input from (sources feeding this step; a step output also adds its variables + a dashed arrow)</label>
       <div className="row">
-        {priorKeys.length === 0 && (
-          <span className="muted">first step - no earlier output to use</span>
-        )}
+        <label className="row" style={{ margin: 0 }}>
+          <input
+            type="checkbox"
+            style={{ width: "auto" }}
+            checked={!!cfg.session}
+            onChange={(e) => setConfig({ session: e.target.checked })}
+          />
+          <span>session</span>
+        </label>
         {priorKeys.map((k) => (
           <label key={k} className="row" style={{ margin: 0 }}>
             <input
@@ -688,103 +931,15 @@ function StepEditor({
         ))}
       </div>
 
-      {isAgent && (
-        <>
-          <label>System prompt</label>
-          <textarea
-            value={String(cfg.system_prompt ?? "")}
-            onChange={(e) => setConfig({ system_prompt: e.target.value })}
-            placeholder="You are a helpful assistant that..."
-            style={{ minHeight: 48 }}
-          />
-
-          <label>User prompt</label>
-          <div className="muted" style={{ marginBottom: 6 }}>
-            Click a variable below to insert it; at run time each {`{{...}}`} is
-            replaced with the real output.
-          </div>
-          {variables.length > 0 ? (
-            <div className="row" style={{ marginBottom: 6 }}>
-              <span className="muted">Insert:</span>
-              {variables.map((v) => (
-                <button
-                  key={v.ref}
-                  className="secondary"
-                  title={v.hint}
-                  style={{ fontFamily: "ui-monospace, monospace" }}
-                  onClick={() => insertRef(v.ref)}
-                >
-                  {`{{${v.label}}}`}
-                </button>
-              ))}
-            </div>
-          ) : (
-            <div className="muted" style={{ marginBottom: 6 }}>
-              No variables yet. Check a step under <b>Depends on</b> above to use its
-              output here.
-            </div>
-          )}
-          <textarea
-            ref={taRef}
-            value={step.promptTemplate ?? ""}
-            onChange={(e) => onChange({ promptTemplate: e.target.value })}
-            placeholder={
-              variables[0]
-                ? `Summarize {{${variables[0].ref}}}`
-                : "What should this agent do?"
-            }
-          />
-
-          <label>Behavior (for testing the orchestrator)</label>
-          <div className="row">
-            {[
-              ["normal", "Normal (done first try)"],
-              ["reask", "Simulate re-ask (2x not done)"],
-              ["stuck", "Stuck (never done -> timeout)"],
-            ].map(([val, lbl]) => (
-              <label key={val} className="row" style={{ margin: 0 }}>
-                <input
-                  type="radio"
-                  name={`preset-${step.id}`}
-                  style={{ width: "auto" }}
-                  checked={preset === val}
-                  onChange={() => setPreset(val)}
-                />
-                <span>{lbl}</span>
-              </label>
-            ))}
-          </div>
-        </>
-      )}
-
       {isParser && (
         <div className="muted" style={{ marginTop: 6 }}>
-          No config. Reads every sheet of the Excel file uploaded in the chat and
-          packs it into one JSON (<code>output.sheets</code>,{" "}
-          <code>output.total_rows</code>).
+          Reads the Excel file into one JSON (<code>output.sheets</code>,{" "}
+          <code>output.total_rows</code>). Set <b>Take input from</b> to{" "}
+          <b>session</b> in Settings below to feed it the file uploaded in the chat.
         </div>
       )}
 
-      <div className="grid2">
-        <div>
-          <label>Max attempts (re-ask limit)</label>
-          <input
-            type="number"
-            min={1}
-            value={step.maxAttempts}
-            onChange={(e) => onChange({ maxAttempts: Number(e.target.value) })}
-          />
-        </div>
-        <div>
-          <label>Timeout (sec)</label>
-          <input
-            type="number"
-            min={1}
-            value={step.timeoutSec}
-            onChange={(e) => onChange({ timeoutSec: Number(e.target.value) })}
-          />
-        </div>
-      </div>
+      <ParamEditor params={params} cfg={cfg} onChange={setConfigReplace} variables={variables} />
 
       <label className="row" style={{ marginTop: 8 }}>
         <input

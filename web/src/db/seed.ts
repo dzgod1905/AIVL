@@ -2,9 +2,9 @@
  * Seed demo workflows.
  * Run: DATABASE_URL=... npm run db:seed  (after db:push)
  *
- * Uses only the units the orchestrator catalog actually serves
- * (see ai-multi-agent/orchestrator/app.py _UNITS): `excel_reader` (parser) and
- * `ai_agent` (prompt runner). Any other unitId is rejected by POST /runs.
+ * Uses only the units the orchestrator catalog actually serves (derived from
+ * each tool's SPEC in ai-multi-agent/node/registry.py): `excel_reader` (parser)
+ * and `ai_agent` (prompt runner). Any other unitId is rejected by POST /runs.
  */
 import "dotenv/config";
 import { db, schema } from "./index";
@@ -45,7 +45,7 @@ async function main() {
   // A. Linear with human pause. The AI step re-asks once (simulate_incomplete
   //    default 1) then pauses for human review before the run completes.
   await seedWorkflow("Demo Linear (human pause)", [
-    { stepKey: "excel", unitId: "excel_reader" },
+    { stepKey: "excel", unitId: "excel_reader", config: { take_input_from: "session" } },
     {
       stepKey: "summary",
       unitId: "ai_agent",
@@ -57,7 +57,7 @@ async function main() {
 
   // B. Chain: parse -> plan -> report, each AI step references the prior output.
   await seedWorkflow("Demo Chain (parse -> plan -> report)", [
-    { stepKey: "excel", unitId: "excel_reader" },
+    { stepKey: "excel", unitId: "excel_reader", config: { take_input_from: "session" } },
     {
       stepKey: "plan",
       unitId: "ai_agent",
@@ -77,7 +77,7 @@ async function main() {
     {
       stepKey: "draft",
       unitId: "ai_agent",
-      config: { simulate_incomplete: 3 },
+      config: { simulate_incomplete: 3, session: true },
       maxAttempts: 8,
       timeoutSec: 30,
     },
@@ -86,7 +86,7 @@ async function main() {
   // D. Timeout: the AI step is stuck (always done=false) -> failed at
   //    maxAttempts / timeoutSec (proves the re-ask loop does not hang).
   await seedWorkflow("Demo Timeout (stuck agent)", [
-    { stepKey: "excel", unitId: "excel_reader" },
+    { stepKey: "excel", unitId: "excel_reader", config: { take_input_from: "session" } },
     {
       stepKey: "stuck",
       unitId: "ai_agent",

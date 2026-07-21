@@ -24,6 +24,7 @@ from shared import config, db
 from shared.schemas import CreateRunRequest, RunView
 from orchestrator.engine import engine, R_DONE, R_FAILED
 from orchestrator.events import bus
+from node.registry import UNITS, UNIT_IDS
 
 log = logging.getLogger("orchestrator.app")
 
@@ -65,31 +66,13 @@ def _startup() -> None:
 # ---- catalog (units grouped by category) ----------------------------------
 # Every unit runs through the same Celery/agent path (type stays "ai_agent").
 # `category` groups them in the builder: "ai_agent" (prompt runner) vs "parser"
-# (code tools that parse data).
-
-_UNITS = [
-    {
-        "id": "ai_agent",
-        "name": "AI Agent",
-        "category": "ai_agent",
-        "description": "Run a prompt. Configure a system prompt and a user prompt.",
-        "outputSchema": {"type": "object", "additionalProperties": True},
-    },
-    {
-        "id": "excel_reader",
-        "name": "Excel Reader",
-        "category": "parser",
-        "description": "Read an Excel file into rows. Configure file path and sheet.",
-        "outputSchema": {"type": "object", "additionalProperties": True},
-    },
-]
-
-_UNIT_IDS = {u["id"] for u in _UNITS}
+# (code tools that parse data). The unit list comes from node/registry.py (each
+# tool's SPEC); adding a tool needs no edit here. See docs/adding-a-tool.md.
 
 
 def _catalog() -> list[dict[str, Any]]:
     out = []
-    for u in _UNITS:
+    for u in UNITS:
         out.append({
             "id": u["id"],
             "name": u["name"],
@@ -98,6 +81,7 @@ def _catalog() -> list[dict[str, Any]]:
             "description": u["description"],
             "inputSchema": {"type": "object", "additionalProperties": True},
             "outputSchema": u["outputSchema"],
+            "params": u.get("params", []),
             "configurable": True,
         })
     return out
@@ -127,7 +111,7 @@ def create_run(req: CreateRunRequest):
     # attacker-controlled task name. automation_tool units are validated remotely
     # by automation-server on /invoke.
     for s in req.steps:
-        if s.unitType == "ai_agent" and s.unitId not in _UNIT_IDS:
+        if s.unitType == "ai_agent" and s.unitId not in UNIT_IDS:
             raise HTTPException(status_code=400,
                                 detail=f"unknown ai_agent unitId: {s.unitId}")
     run_id = engine.create_run(req)

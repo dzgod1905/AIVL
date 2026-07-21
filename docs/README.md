@@ -10,6 +10,7 @@ Reference docs for the workflow builder + multi-agent backend.
 | [flow.md](flow.md) | A single workflow run end to end: from "Start" in the UI to persisted step output. |
 | [security.md](security.md) | Threat model, what is enforced in code, and what must be configured per deployment. |
 | [deployment.md](deployment.md) | Running the two backend stacks on different machines, with the web app on a third host. |
+| [adding-a-tool.md](adding-a-tool.md) | Add a new tool (unit) or category to the ai-multi-agent node registry. The one-file-plus-one-line flow. |
 
 ## The pieces at a glance
 

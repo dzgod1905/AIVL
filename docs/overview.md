@@ -60,10 +60,11 @@ ai-multi-agent/
     engine.py     # executor tuần tự: _schedule_loop chạy step theo order, _execute_step
     events.py     # EventBus in-process (pub/sub cho SSE)
   node/           # các unit, mỗi unit là 1 Celery task
-    ai_agent/ai_agent.py      # chạy prompt (dummy: sleep + echo). task name "node.ai_agent"
+    ai_agent/ai_agent.py      # chạy prompt: gọi LLM thật nếu có AI_AGENT_KEYS, không thì echo dummy. task "node.ai_agent"
     parser/excel_reader.py    # đọc Excel -> rows (openpyxl). task name "node.excel_reader"
+    _template.py  # template copy-paste để thêm tool mới (inert, chưa đăng ký)
     base.py       # run_step: khung done/re-ask/output chung
-    registry.py   # map unitId -> Celery task (dùng cho eager dispatch)
+    registry.py   # SPEC-driven: derive UNITS/TASK_BY_AGENT/CATEGORIES/UNIT_IDS/QUEUES; điểm sửa duy nhất khi thêm tool
   shared/
     celery_app.py # Celery app + routing node.<name> -> queue:<name>; nhánh eager
     config.py     # đọc env
@@ -74,7 +75,7 @@ web/src/
   app/
     page.tsx                # trang chủ: list workflow -> bấm mở list session
     workflow/[id]/page.tsx  # list session của 1 workflow + tạo session mới (chạy song song)
-    builder/page.tsx        # dựng workflow (bước tuần tự, promptTemplate + biến tham chiếu step trước)
+    builder/page.tsx        # dựng workflow (bước tuần tự; config params required/optional render generic từ SPEC; Input from; biến tham chiếu step trước)
     session/[id]/page.tsx   # chat theo session: run + SSE + DAG live (node sáng theo status)
     api/                    # route REST proxy sang orchestrator
       runs/route.ts, runs/[id]/{route,events,resume}, catalog, agents, workflows
@@ -114,7 +115,7 @@ sequenceDiagram
     loop mỗi bước theo order (tuần tự)
         E->>E: chờ bước trước done rồi mới chạy bước kế
         E->>K: send_task node.<agent> (eager .apply | queue Redis)
-        K->>K: chạy (ai_agent sleep+echo | excel_reader parse)
+        K->>K: chạy (ai_agent gọi LLM/echo | excel_reader parse)
         K-->>E: {done, output}
         alt done=false
             E->>K: re-ask attempt+1 (<= maxAttempts/timeoutSec)
@@ -180,7 +181,7 @@ sẽ dựng lại lịch sử chat từ các run cũ.
      về chạy, trả kết quả qua Redis backend. Đây là phân phối pull-based đúng nghĩa. **Lập lịch
      = điều phối chéo**: worker phục vụ bước từ nhiều run đang ở các step khác nhau.
 
-7. **agent chạy (node task).** `ai_agent` trả `{ text, system_prompt, user_prompt }` (dummy).
+7. **agent chạy (node task).** `ai_agent` trả `{ text, system_prompt, user_prompt, provider, model }` (gọi LLM thật nếu `AI_AGENT_KEYS` có key dùng được, không thì echo dummy).
    `excel_reader` parse file trả `{ sheets, total_rows, ... }`. Mỗi task trả `{ done, output }`.
    Nếu `done=false` → engine **re-ask** (attempt+1) sau `REASK_DELAY_SEC`, giới hạn bởi
    `maxAttempts` và `timeoutSec`; vượt ngưỡng → bước `failed`, run `failed` (không lặp vô tận).
@@ -212,7 +213,7 @@ flowchart TD
 
 - Chạy đúng thứ tự `read → plan → review → report`, mỗi bước chờ bước trước `done`.
 - `review` có `humanInvolved` → xong thì run `paused_for_human`, chờ Continue mới tới `report`.
-- `report` tham chiếu `{{read.output}}` (chọn `read` ở ô "Use outputs of" trong builder) → vẽ
+- `report` tham chiếu `{{read.output}}` (chọn `read` ở ô "Input from" trong builder) → vẽ
   mũi tên đứt. Vì `read` chạy trước nên biến luôn resolve được; thứ tự chạy không đổi.
 
 ## Cách chạy
@@ -228,10 +229,11 @@ docker compose up --build
 ```
 
 Dựng: `redis` (:6379), `orchestrator-db` (Postgres :5432), `ai-multi-agent-api` (:8001),
-`ai-multi-agent-workers` (concurrency 6), `automation-server` (:8002). api + workers tự nhận
+`ai-multi-agent-workers` (pool = `WORKFLOW_CONCURRENCY` x `SESSION_CONCURRENCY`, mặc định 1,
+derive trong `worker.sh`), `automation-server` (:8002). api + workers tự nhận
 `ORCH_DATABASE_URL` trỏ vào Postgres container.
 
-### Cách C — Local, Celery workers thật (broker Memurai, không Docker)
+### Cách B — Local, Celery workers thật (broker Memurai, không Docker)
 
 Redis không chạy native Windows → dùng **Memurai** (Redis-compatible, service Windows,
 cổng 6379) hoặc Redis trong WSL. Broker chạy rồi thì mở 3 terminal, KHÔNG đặt `CELERY_EAGER`:
@@ -247,8 +249,10 @@ py -3.12 -m uvicorn orchestrator.app:app --host 127.0.0.1 --port 8001
 cd ai-multi-agent
 $env:PYTHONPATH="$PWD"
 $env:REDIS_URL="redis://localhost:6379/0"
+# queues derived from the registry (new tools picked up automatically)
+$Q = py -3.12 -c "from node.registry import QUEUES; print(','.join(QUEUES))"
 py -3.12 -m celery -A shared.celery_app.celery_app worker `
-  -Q queue:ai_agent,queue:excel_reader --pool=threads --concurrency=6 --loglevel=info
+  -Q $Q --pool=threads --concurrency=6 --loglevel=info
 
 # Terminal 3 - web
 cd web
@@ -316,7 +320,7 @@ cd web && npm run dev -- -H 0.0.0.0
 
 Máy khác mở `http://<IP-máy-B>:3000`. Cổng 8001/8002 giữ nội bộ máy B, không cần mở.
 
-**Native (không Docker):** giống Cách C, cần thêm Python 3.12 + Memurai trên máy B, chạy 3
+**Native (không Docker):** giống Cách B, cần thêm Python 3.12 + Memurai trên máy B, chạy 3
 terminal (api + worker + web). Dài và dễ lệch env hơn Docker.
 
 ## Kiểm tra nhanh
@@ -349,6 +353,6 @@ chạy đồng thời. DAG bên phải `session/[id]` sáng node theo `step_stat
 
 | Service | Biến |
 |---------|------|
-| ai-multi-agent | `REDIS_URL`, `ORCH_DATABASE_URL`, `SQLITE_PATH`, `CELERY_EAGER`, `AUTOMATION_SERVER_URL`, `ORCH_API_TOKEN`, `AUTOMATION_API_TOKEN`, `AI_AGENT_DELAY_SEC`, `EXCEL_READER_DELAY_SEC`, `DEFAULT_SIMULATE_INCOMPLETE`, `DEFAULT_MAX_ATTEMPTS`, `REASK_DELAY_SEC`, `MAX_XLSX_BYTES`, `WORKER_CONCURRENCY` |
+| ai-multi-agent | `REDIS_URL`, `ORCH_DATABASE_URL`, `SQLITE_PATH`, `CELERY_EAGER`, `AUTOMATION_SERVER_URL`, `ORCH_API_TOKEN`, `AUTOMATION_API_TOKEN`, `DEFAULT_SIMULATE_INCOMPLETE`, `DEFAULT_MAX_ATTEMPTS`, `REASK_DELAY_SEC`, `MAX_XLSX_BYTES`, `SESSION_CONCURRENCY`, `WORKFLOW_CONCURRENCY` |
 | automation-server | `PORT`, `AUTOMATION_API_TOKEN` |
 | web | `DATABASE_URL` (Neon), `AI_MULTI_AGENT_URL`, `ORCH_API_TOKEN` |

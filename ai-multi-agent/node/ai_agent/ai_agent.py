@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import random
-import time
 from typing import Any
 
 import httpx
@@ -33,11 +32,48 @@ log = logging.getLogger("node.ai_agent")
 
 NAME = "ai_agent"
 
+# Self-describing catalog entry. registry.py derives the /catalog listing, queue
+# routing, task map and category grouping from this (see docs/adding-a-tool.md).
+# id MUST equal NAME (and the Celery task suffix node.<id>).
+SPEC = {
+    "id": NAME,
+    "name": "AI Agent",
+    "category": "ai_agent",
+    "description": "Run a prompt. Configure a system prompt and a user prompt.",
+    "outputSchema": {"type": "object", "additionalProperties": True},
+    "params": [
+        {
+            "key": "system_prompt",
+            "label": "System prompt",
+            "type": "text",
+            "default": "",
+            "placeholder": "You are a helpful assistant that...",
+            "description": "Sets the assistant's role/behavior.",
+        },
+        {
+            "key": "user_prompt",
+            "label": "User prompt",
+            "type": "text",
+            "default": "",
+            "required": True,
+            "placeholder": "What should this agent do? Use {{step.output}} to insert an earlier step's result.",
+            "description": "The instruction sent to the model. {{stepKey.output}} is replaced with that step's output at run time.",
+        },
+    ],
+}
+
 
 def _resolve_prompts(input_obj: dict[str, Any], conf: dict[str, Any]) -> tuple[str, str]:
-    """system prompt from config; user prompt = rendered template or a config fallback."""
+    """system prompt from config; user prompt resolved in priority order:
+    rendered promptTemplate (input["prompt"]) -> session text the user typed
+    (input["session_text"], when the step opted into it) -> config.user_prompt."""
     system_prompt = str(conf.get("system_prompt", "") or "")
-    user_prompt = str(input_obj.get("prompt", conf.get("user_prompt", "")) or "")
+    user_prompt = str(
+        input_obj.get("prompt")
+        or input_obj.get("session_text")
+        or conf.get("user_prompt", "")
+        or ""
+    )
     return system_prompt, user_prompt
 
 
@@ -149,6 +185,4 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
                             entry["provider"], entry["model"], exc)
 
     # dummy path: empty pool, empty prompt, or every key failed
-    if cfg.AI_AGENT_DELAY_SEC > 0:
-        time.sleep(cfg.AI_AGENT_DELAY_SEC)
     return run_step(NAME, payload, _dummy_output)

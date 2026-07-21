@@ -50,9 +50,11 @@ services:
       - AUTOMATION_SERVER_URL=${AUTOMATION_SERVER_URL:?set AUTOMATION_SERVER_URL}
       - ORCH_API_TOKEN=${ORCH_API_TOKEN:?set ORCH_API_TOKEN}
       - AUTOMATION_API_TOKEN=${AUTOMATION_API_TOKEN:?set AUTOMATION_API_TOKEN}
-      # Whole-run (session) gate. 1 = one run at a time (session A fully done
-      # before B starts). The engine runs in THIS api process, so set it here.
-      - RUN_CONCURRENCY=${RUN_CONCURRENCY:-1}
+      # Concurrency gates. The engine runs in THIS api process, so set them here.
+      #   SESSION_CONCURRENCY  : parallel sessions within one workflow.
+      #   WORKFLOW_CONCURRENCY : distinct workflows running at once.
+      - SESSION_CONCURRENCY=${SESSION_CONCURRENCY:-1}
+      - WORKFLOW_CONCURRENCY=${WORKFLOW_CONCURRENCY:-1}
       # Optional: real ai_agent LLM calls (empty => dummy). Eager path runs here.
       - AI_AGENT_KEYS=${AI_AGENT_KEYS:-}
     volumes:
@@ -72,7 +74,9 @@ services:
       - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
       - ORCH_DATABASE_URL=postgresql://orch:${ORCH_DB_PASSWORD}@orchestrator-db:5432/orchestrator
       - SQLITE_PATH=/data/orchestrator.db
-      - WORKER_CONCURRENCY=${WORKER_CONCURRENCY:-1}
+      # Sized so the task pool never bottlenecks the api's two gates.
+      - SESSION_CONCURRENCY=${SESSION_CONCURRENCY:-1}
+      - WORKFLOW_CONCURRENCY=${WORKFLOW_CONCURRENCY:-1}
       # Optional: real ai_agent LLM calls (empty => dummy). Broker path runs here.
       - AI_AGENT_KEYS=${AI_AGENT_KEYS:-}
     volumes:
@@ -82,12 +86,9 @@ services:
         condition: service_healthy
       orchestrator-db:
         condition: service_healthy
-    # One container, all agent queues, concurrency>1 -> visible parallelism.
-    # Queues MUST match config.AGENTS values (one queue per unit).
-    command: >
-      celery -A shared.celery_app.celery_app worker
-      -Q queue:ai_agent,queue:excel_reader
-      --concurrency=${WORKER_CONCURRENCY:-1} --loglevel=info
+    # One container, all unit queues. worker.sh derives the queue set from the
+    # registry and sizes the pool = WORKFLOW_CONCURRENCY x SESSION_CONCURRENCY.
+    command: ["sh", "worker.sh"]
 
 volumes:
   agent-data:

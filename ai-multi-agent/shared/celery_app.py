@@ -1,16 +1,19 @@
-"""Celery app: Redis broker + backend, one queue per agent.
+"""Celery app: Redis broker + backend, one queue per unit.
 
-Task routing sends each agent's task to its own queue (queue:parser, ...). Workers
-subscribe to those queues; an idle worker pulls the next task. This IS the
+Task routing sends each unit's task to its own queue (queue:ai_agent, ...).
+Workers subscribe to those queues; an idle worker pulls the next task. This IS the
 "give work to a free agent" mechanism (pull-based) - the orchestrator never picks
 an agent instance itself.
+
+The queue name is DERIVED from the task name (node.<id> -> queue:<id>) by the
+router below, so adding a tool needs no routing edit here - the registry's SPEC
+is the only source (see node/registry.py, docs/adding-a-tool.md).
 """
 from __future__ import annotations
 
 import os
 
 from celery import Celery
-from kombu import Queue
 
 from shared import config
 
@@ -21,13 +24,22 @@ celery_app = Celery(
     include=["node.registry"],
 )
 
-# One named queue per unit.
-celery_app.conf.task_queues = [Queue(q) for q in config.AGENTS.values()]
 
-# Route each unit task name (node.<name>) to its queue.
-celery_app.conf.task_routes = {
-    f"node.{name}": {"queue": queue} for name, queue in config.AGENTS.items()
-}
+def _route_task(name, args=None, kwargs=None, options=None, task=None, **kw):
+    """Route node.<id> -> queue:<id>, derived from the task name.
+
+    No static unit->queue map, so a new tool routes correctly with zero edits.
+    Non-node task names fall through to Celery's default queue.
+    """
+    if name and name.startswith("node."):
+        return {"queue": "queue:" + name.split(".", 1)[1]}
+    return None
+
+
+# Dynamic routing + auto-create queues on first use. Which queues a worker
+# actually consumes is decided by its -Q flag (worker.sh, from registry.QUEUES).
+celery_app.conf.task_routes = (_route_task,)
+celery_app.conf.task_create_missing_queues = True
 
 celery_app.conf.update(
     task_serializer="json",

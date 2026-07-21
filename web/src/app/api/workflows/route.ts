@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { desc } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { db, schema } from "@/db";
 import { hasCycle } from "@/lib/graph";
 import type { StepDef } from "@/lib/types";
@@ -18,8 +18,21 @@ export async function GET() {
 // POST: save a workflow + its steps. Rejects dependsOn cycles.
 export async function POST(req: NextRequest) {
   const body = (await req.json()) as { name: string; steps: StepDef[] };
-  if (!body.name || !Array.isArray(body.steps) || body.steps.length === 0) {
+  const name = (body.name ?? "").trim();
+  if (!name || !Array.isArray(body.steps) || body.steps.length === 0) {
     return NextResponse.json({ error: "name and steps required" }, { status: 400 });
+  }
+
+  // reject a name already taken by another workflow
+  const [dup] = await db
+    .select({ id: schema.workflows.id })
+    .from(schema.workflows)
+    .where(eq(schema.workflows.name, name));
+  if (dup) {
+    return NextResponse.json(
+      { error: `a workflow named "${name}" already exists` },
+      { status: 409 },
+    );
   }
 
   const keys = body.steps.map((s) => s.stepKey);
@@ -44,7 +57,7 @@ export async function POST(req: NextRequest) {
 
   const [wf] = await db
     .insert(schema.workflows)
-    .values({ name: body.name })
+    .values({ name })
     .returning();
 
   await db.insert(schema.workflowSteps).values(

@@ -31,6 +31,7 @@ from shared.celery_app import celery_app
 from shared.clients import automation_invoke
 from shared.schemas import CreateRunRequest, StepSpec
 from orchestrator.events import bus
+from node.registry import UNIT_IDS
 
 log = logging.getLogger("orchestrator.engine")
 
@@ -66,12 +67,17 @@ class Engine:
         self.runs: dict[str, Run] = {}
         self._lock = threading.Lock()
         # agent name -> count of in-flight tasks (busy if > 0)
-        self.agent_inflight: dict[str, int] = {a: 0 for a in config.AGENTS}
+        self.agent_inflight: dict[str, int] = {a: 0 for a in UNIT_IDS}
         self._agent_lock = threading.Lock()
-        # Whole-run gate: only RUN_CONCURRENCY runs may execute steps at once.
-        # With 1, run B blocks here until run A fully terminates (done/failed),
-        # so entire sessions run one-at-a-time instead of interleaving steps.
-        self._run_slots = threading.Semaphore(config.RUN_CONCURRENCY)
+        # ---- concurrency gates (two tiers, both keyed by workflowId) ----------
+        # WORKFLOW_CONCURRENCY : max DISTINCT workflows active at once.
+        # SESSION_CONCURRENCY  : max parallel sessions (runs) WITHIN one workflow.
+        # A workflow holds a distinct-workflow slot while it has >= 1 active run;
+        # its runs then queue on a per-workflow session semaphore.
+        self._gate = threading.Condition(threading.Lock())
+        self._wf_active: dict[str, int] = {}               # workflowId -> active runs
+        self._wf_sem: dict[str, threading.Semaphore] = {}  # workflowId -> session gate
+        self._distinct_wf = 0                              # # workflows active now
 
     # ---- agent busy/idle bookkeeping -------------------------------------
 
@@ -87,6 +93,46 @@ class Engine:
                 {"agent": a, "inflight": n, "state": "busy" if n > 0 else "idle"}
                 for a, n in self.agent_inflight.items()
             ]
+
+    # ---- concurrency gates -----------------------------------------------
+
+    def _acquire_slot(self, run: "Run") -> None:
+        """Two-tier admission for a run's schedule loop.
+
+        Tier 1 (distinct workflows): when this workflow goes from 0 -> active it
+        must claim one of WORKFLOW_CONCURRENCY slots, blocking if all are taken.
+        Tier 2 (sessions per workflow): every run then acquires one of this
+        workflow's SESSION_CONCURRENCY session slots, blocking if that many
+        sessions of the SAME workflow already run.
+        """
+        wf = run.workflow_id
+        with self._gate:
+            if self._wf_active.get(wf, 0) == 0:
+                # opening this workflow: wait for a free distinct-workflow slot
+                while self._distinct_wf >= config.WORKFLOW_CONCURRENCY:
+                    self._gate.wait()
+                if self._wf_active.get(wf, 0) == 0:  # re-check after waiting
+                    self._distinct_wf += 1
+            self._wf_active[wf] = self._wf_active.get(wf, 0) + 1
+            sem = self._wf_sem.setdefault(
+                wf, threading.Semaphore(config.SESSION_CONCURRENCY))
+        sem.acquire()  # blocks if SESSION_CONCURRENCY sessions of wf already run
+
+    def _release_slot(self, run: "Run") -> None:
+        """Release the session slot, and the distinct-workflow slot when this was
+        the workflow's last active run. Called on every loop exit path."""
+        wf = run.workflow_id
+        with self._gate:
+            sem = self._wf_sem.get(wf)
+        if sem is not None:
+            sem.release()
+        with self._gate:
+            self._wf_active[wf] = max(0, self._wf_active.get(wf, 0) - 1)
+            if self._wf_active[wf] == 0:
+                self._wf_active.pop(wf, None)
+                self._wf_sem.pop(wf, None)
+                self._distinct_wf = max(0, self._distinct_wf - 1)
+                self._gate.notify_all()  # wake a workflow waiting for a slot
 
     # ---- run lifecycle ----------------------------------------------------
 
@@ -126,12 +172,12 @@ class Engine:
         `done`. Parallelism lives BETWEEN runs (many loops + the worker pool), not
         inside a single run.
 
-        Gated by self._run_slots (config.RUN_CONCURRENCY): with 1, this loop waits
-        for its whole-run slot before the first step, so run B does not interleave
-        with run A - A finishes entirely, then B begins. Slot is released on every
-        exit path (done / failed / crash).
+        Gated by the two-tier admission (config.WORKFLOW_CONCURRENCY /
+        SESSION_CONCURRENCY): this loop blocks in _acquire_slot before the first
+        step until both a distinct-workflow slot and a per-workflow session slot
+        are free. The slot is released on every exit path (done / failed / crash).
         """
-        self._run_slots.acquire()
+        self._acquire_slot(run)
         try:
           try:
             for step_key in run.order:
@@ -165,21 +211,46 @@ class Engine:
                 db.set_run_status(run.id, R_FAILED)
             self._emit(run, {"type": "run_status", "status": R_FAILED, "reason": str(exc)})
         finally:
-            self._run_slots.release()
+            self._release_slot(run)
 
     # ---- step execution ---------------------------------------------------
 
     def _build_input(self, run: Run, spec: StepSpec) -> dict[str, Any]:
-        """Build a step's input: initial input + rendered prompt.
+        """Build a step's input.
 
-        Because steps run in order, any {{stepKey.output}} a prompt references
-        belongs to an already-finished earlier step, so it resolves here.
+        Session inputs (the file/text the user supplied when starting the run)
+        are opt-in PER STEP via config flags, so ANY tool can choose to receive
+        them (not just ai_agent / excel_reader):
+          config.session_text -> the typed request text  -> input["session_text"]
+          config.session_file -> the uploaded file        -> input["file"], input["file_b64"]
+        A step that opts into neither starts from an empty input (plus any
+        rendered prompt). {{stepKey.output}} variables resolve from earlier
+        steps' outputs and are independent of the session input.
         """
-        step_input: dict[str, Any] = dict(run.initial_input)
+        conf = spec.config or {}
+        step_input: dict[str, Any] = {}
 
-        # promptTemplate rendering (ai_agent only): replace {{stepKey.output}}
-        if spec.promptTemplate and spec.unitType == "ai_agent":
-            step_input["prompt"] = self._render_prompt(run, spec.promptTemplate)
+        # One `session` flag feeds the chat text AND file into the step (a tool
+        # uses whichever it needs). A tool may instead declare a `take_input_from`
+        # param set to "session" (e.g. excel_reader's required source selector).
+        # Legacy split flags still honored.
+        if (
+            conf.get("session")
+            or conf.get("take_input_from") == "session"
+            or conf.get("session_text")
+            or conf.get("session_file")
+        ):
+            step_input["session_text"] = run.initial_input.get("request", "")
+            step_input["file"] = run.initial_input.get("file")
+            step_input["file_b64"] = run.initial_input.get("file_b64")
+
+        # prompt rendering (ai_agent only): replace {{stepKey.output}}. The user
+        # prompt comes from config.user_prompt (a declared param); legacy steps
+        # still carry it in promptTemplate, which takes precedence if present.
+        if spec.unitType == "ai_agent":
+            template = spec.promptTemplate or str(conf.get("user_prompt") or "")
+            if template:
+                step_input["prompt"] = self._render_prompt(run, template)
 
         return step_input
 
@@ -189,6 +260,14 @@ class Engine:
         # refers to that root and is skipped rather than indexed into.
         parts = ref.split(".")
         dep = parts[0]
+        # session.text / session.file resolve from the run's initial chat input
+        if dep == "session":
+            sub = parts[1] if len(parts) > 1 else "text"
+            if sub == "text":
+                return run.initial_input.get("request", "")
+            if sub == "file":
+                return run.initial_input.get("file", "")
+            return None
         val: Any = run.step_output.get(dep)
         rest = parts[1:]
         if rest and rest[0] == "output":

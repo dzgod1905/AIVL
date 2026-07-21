@@ -15,3 +15,7 @@ node_modules/
 
 # uv
 .uv/
+
+# Secrets / keys (never commit)
+*.key
+*.pem
