@@ -42,11 +42,18 @@ def _pg_pool() -> Any:
                 from psycopg.rows import dict_row
                 from psycopg_pool import ConnectionPool
 
+                # Serverless Postgres (Neon) drops idle connections; a pooled
+                # conn then fails on reuse with "SSL connection has been closed
+                # unexpectedly". `check` validates (and transparently replaces)
+                # each connection on checkout; `max_idle` recycles conns before
+                # the server would kill them.
                 _pool = ConnectionPool(
                     config.ORCH_DATABASE_URL,
                     min_size=1,
                     max_size=10,
                     kwargs={"row_factory": dict_row},
+                    check=ConnectionPool.check_connection,
+                    max_idle=60.0,
                     open=True,
                 )
     return _pool
