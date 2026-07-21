@@ -19,9 +19,10 @@ services:
     plan: free            # free = 1 instance, spins down after ~15 min idle
     numInstances: 1       # MUST stay 1 (in-memory run state)
     healthCheckPath: /health
-    # Bind Render's injected $PORT (Dockerfile CMD hardcodes 8001) and enable
-    # eager mode so no broker/worker is required.
-    dockerCommand: sh -c "CELERY_EAGER=1 uvicorn orchestrator.app:app --host 0.0.0.0 --port $PORT"
+    # Bind Render's injected $PORT (Dockerfile CMD hardcodes 8001). Eager mode is
+    # turned on via the CELERY_EAGER env var below, not inline here (an inline
+    # VAR=val prefix makes Render treat the whole string as one command -> exit 127).
+    dockerCommand: uvicorn orchestrator.app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: CELERY_EAGER
         value: "1"
