@@ -1,0 +1,37 @@
+# Render blueprint: single always-on orchestrator (ai-multi-agent) for the web app.
+#
+# Runs the FastAPI orchestrator in CELERY_EAGER mode: agent tasks execute
+# in-process, so NO Redis and NO separate Celery worker are needed. The service
+# is STATEFUL (in-memory run registry + threading concurrency gates), so it must
+# stay a SINGLE instance - do not raise numInstances or enable autoscaling, or
+# run state fragments across instances.
+#
+# Deploy: Render Dashboard -> New -> Blueprint -> pick this repo. Then fill the
+# `sync: false` secrets below in the dashboard. After it goes live, set the
+# service URL (https://<name>.onrender.com) as AI_MULTI_AGENT_URL on Vercel, and
+# use the SAME ORCH_API_TOKEN value on both sides.
+services:
+  - type: web
+    name: aivl-orchestrator
+    runtime: docker
+    rootDir: ai-multi-agent
+    dockerfilePath: ./Dockerfile
+    plan: free            # free = 1 instance, spins down after ~15 min idle
+    numInstances: 1       # MUST stay 1 (in-memory run state)
+    healthCheckPath: /health
+    # Bind Render's injected $PORT (Dockerfile CMD hardcodes 8001) and enable
+    # eager mode so no broker/worker is required.
+    dockerCommand: sh -c "CELERY_EAGER=1 uvicorn orchestrator.app:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: CELERY_EAGER
+        value: "1"
+      # Shared bearer secret. MUST equal ORCH_API_TOKEN set on Vercel.
+      - key: ORCH_API_TOKEN
+        sync: false
+      # JSON key pool for real LLM calls. Empty/unset => ai_agent uses dummy echo.
+      - key: AI_AGENT_KEYS
+        sync: false
+      # Optional: Neon/Postgres URL to persist across restarts. Unset => sqlite
+      # inside the container (wiped on every redeploy/restart).
+      - key: ORCH_DATABASE_URL
+        sync: false
